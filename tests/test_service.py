@@ -204,3 +204,112 @@ def test_context_usage_and_turn_plan_notifications_are_forwarded(qtbot) -> None:
 
     assert usage_updates == [usage]
     assert plan_updates == [plan]
+
+
+def test_compact_review_and_custom_review_rpc_parameters(qtbot) -> None:
+    rpc = FakeRpc()
+    service = CodexService(rpc)  # type: ignore[arg-type]
+    service.current_thread_id = "thr_1"
+    service.current_thread_ready = True
+
+    service.compact_thread()
+    service.start_review()
+    service.start_review("Проверь обработку ошибок")
+
+    assert rpc.calls[0] == (
+        "thread/compact/start",
+        {"threadId": "thr_1"},
+    )
+    assert rpc.calls[1] == (
+        "review/start",
+        {
+            "threadId": "thr_1",
+            "delivery": "inline",
+            "target": {"type": "uncommittedChanges"},
+        },
+    )
+    assert rpc.calls[2] == (
+        "review/start",
+        {
+            "threadId": "thr_1",
+            "delivery": "inline",
+            "target": {
+                "type": "custom",
+                "instructions": "Проверь обработку ошибок",
+            },
+        },
+    )
+
+
+def test_fork_switches_after_loading_copy_and_refreshes_history(qtbot) -> None:
+    rpc = FakeRpc()
+    service = CodexService(rpc)  # type: ignore[arg-type]
+    service.connected = True
+    service.current_project = "/repo"
+    service.current_thread_id = "thr_source"
+    loaded = []
+    switched = []
+    service.threadLoaded.connect(loaded.append)
+
+    service.fork_thread(switched.append)
+    assert rpc.calls[0] == (
+        "thread/fork",
+        {"threadId": "thr_source", "ephemeral": False},
+    )
+    rpc.callbacks[0]({"thread": {"id": "thr_copy"}}, None)
+
+    assert service.current_thread_id == "thr_copy"
+    assert rpc.calls[1] == (
+        "thread/read",
+        {"threadId": "thr_copy", "includeTurns": True},
+    )
+    copied = {
+        "id": "thr_copy",
+        "turns": [{"items": [{"id": "old", "type": "agentMessage", "text": "copy"}]}],
+    }
+    rpc.callbacks[1]({"thread": copied}, None)
+
+    assert loaded == [copied]
+    assert switched == [True]
+    assert rpc.calls[2][0] == "thread/list"
+    assert all(method not in {"thread/archive", "thread/delete"} for method, _params in rpc.calls)
+
+
+def test_collaboration_mode_can_transition_from_plan_to_default(qtbot, tmp_path) -> None:
+    rpc = FakeRpc()
+    service = CodexService(rpc)  # type: ignore[arg-type]
+    service.current_project = str(tmp_path)
+    service.current_thread_id = "thr_1"
+    service.current_thread_ready = True
+
+    service.send_message(
+        "Составь план",
+        [],
+        "gpt-test",
+        "high",
+        AccessMode.READ_ONLY,
+        "plan",
+    )
+    rpc.callbacks[-1]({"turn": {"id": "plan_turn"}}, None)
+    rpc.notification.emit(
+        "turn/completed",
+        {"turn": {"id": "plan_turn", "status": "completed"}},
+    )
+    service.send_message(
+        "Теперь реализуй",
+        [],
+        "gpt-test",
+        "high",
+        AccessMode.WORKSPACE_WRITE,
+    )
+
+    turn_calls = [params for method, params in rpc.calls if method == "turn/start"]
+    assert turn_calls[0]["collaborationMode"]["mode"] == "plan"
+    assert turn_calls[1]["collaborationMode"] == {
+        "mode": "default",
+        "settings": {
+            "model": "gpt-test",
+            "reasoning_effort": "high",
+            "developer_instructions": None,
+        },
+    }

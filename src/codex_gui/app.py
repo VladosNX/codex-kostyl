@@ -67,6 +67,11 @@ QSplitter::handle { background: #2a2d2d; }
 #composer { background: transparent; color: #eeeeeb; border: 0; padding: 7px 5px; font-size: 14px; }
 #composer:disabled { color: #747874; }
 #composerHint { color: #626762; font-size: 10px; padding-top: 3px; }
+#slashCommandPanel { background: #1b1e1d; border: 1px solid #3a403c; border-radius: 11px; }
+#slashCommandList { background: transparent; border: 0; outline: 0; }
+#slashCommandList::item { color: #aeb5b0; border: 0; border-radius: 7px; padding: 5px 9px; }
+#slashCommandList::item:selected { background: #303632; color: #f2f3ef; }
+#slashCommandList::item:disabled { color: #666b67; background: transparent; }
 #optionCombo { background: transparent; color: #9ca19c; border: 0; border-radius: 6px; padding: 5px 7px; min-height: 20px; font-size: 11px; }
 #optionCombo:hover, #optionCombo:on { background: #292c2c; color: #e8e8e5; }
 #weeklyLimit { background: transparent; }

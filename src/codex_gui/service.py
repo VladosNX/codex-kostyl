@@ -329,20 +329,14 @@ class CodexService(QObject):
             "approvalPolicy": access_mode.approval_policy,
             "sandboxPolicy": access_mode.sandbox_policy(self.current_project),
         }
-        if collaboration_mode == PLAN_MODE_VALUE:
-            params["collaborationMode"] = {
-                "mode": PLAN_MODE_VALUE,
-                "settings": {
-                    "model": model,
-                    "reasoning_effort": effort,
-                    "developer_instructions": None,
-                },
-            }
-        else:
-            if model:
-                params["model"] = model
-            if effort:
-                params["effort"] = effort
+        params["collaborationMode"] = {
+            "mode": PLAN_MODE_VALUE if collaboration_mode == PLAN_MODE_VALUE else "default",
+            "settings": {
+                "model": model,
+                "reasoning_effort": effort,
+                "developer_instructions": None,
+            },
+        }
         self.turnStateChanged.emit("starting")
 
         def started(result: Any, error: dict[str, Any] | None) -> None:
@@ -351,9 +345,110 @@ class CodexService(QObject):
                 self._emit_rpc_error(error)
                 return
             turn = result.get("turn", {}) if isinstance(result, dict) else {}
-            self.current_turn_id = str(turn.get("id", ""))
+            turn_id = str(turn.get("id", ""))
+            if turn_id:
+                self.current_turn_id = turn_id
 
         self.rpc.request("turn/start", params, started)
+
+    def compact_thread(self) -> None:
+        """Compact the current thread and wait for its turn notifications."""
+        if not self.current_thread_id:
+            self.errorOccurred.emit("Сначала создайте чат")
+            return
+        self._start_action_turn(
+            "thread/compact/start",
+            {"threadId": self.current_thread_id},
+        )
+
+    def start_review(self, instructions: str = "") -> None:
+        """Start an inline review for uncommitted changes or custom instructions."""
+        if not self.current_thread_id:
+            self.errorOccurred.emit("Сначала создайте чат")
+            return
+        target: dict[str, Any]
+        if instructions.strip():
+            target = {"type": "custom", "instructions": instructions.strip()}
+        else:
+            target = {"type": "uncommittedChanges"}
+        self._start_action_turn(
+            "review/start",
+            {
+                "threadId": self.current_thread_id,
+                "delivery": "inline",
+                "target": target,
+            },
+        )
+
+    def _start_action_turn(self, method: str, params: dict[str, Any]) -> None:
+        self.turnStateChanged.emit("starting")
+
+        def started(result: Any, error: dict[str, Any] | None) -> None:
+            if error:
+                self.turnStateChanged.emit("failed")
+                self._emit_rpc_error(error)
+                return
+            turn = result.get("turn", {}) if isinstance(result, dict) else {}
+            turn_id = str(turn.get("id", ""))
+            if turn_id:
+                self.current_turn_id = turn_id
+
+        self.rpc.request(method, params, started)
+
+    def fork_thread(self, after_switched: Any | None = None) -> None:
+        """Create a persistent fork, switch to it, and load its copied history."""
+        source_thread_id = self.current_thread_id
+        if not source_thread_id:
+            self.errorOccurred.emit("Сначала создайте чат")
+            if after_switched:
+                after_switched(False)
+            return
+
+        def forked(result: Any, error: dict[str, Any] | None) -> None:
+            if error:
+                self._emit_rpc_error(error)
+                if after_switched:
+                    after_switched(False)
+                return
+            thread = result.get("thread", {}) if isinstance(result, dict) else {}
+            thread_id = str(thread.get("id", ""))
+            if not thread_id:
+                self.errorOccurred.emit("Codex не вернул идентификатор копии чата")
+                if after_switched:
+                    after_switched(False)
+                return
+            self.current_thread_id = thread_id
+            self.current_turn_id = ""
+            self.current_thread_ready = True
+            self.currentThreadChanged.emit(thread_id)
+
+            def loaded(read_result: Any, read_error: dict[str, Any] | None) -> None:
+                if read_error:
+                    self._emit_rpc_error(read_error)
+                    if after_switched:
+                        after_switched(False)
+                    return
+                loaded_thread = (
+                    read_result.get("thread", {})
+                    if isinstance(read_result, dict)
+                    else {}
+                )
+                self.threadLoaded.emit(loaded_thread)
+                self.list_threads()
+                if after_switched:
+                    after_switched(True)
+
+            self.rpc.request(
+                "thread/read",
+                {"threadId": thread_id, "includeTurns": True},
+                loaded,
+            )
+
+        self.rpc.request(
+            "thread/fork",
+            {"threadId": source_thread_id, "ephemeral": False},
+            forked,
+        )
 
     def interrupt(self) -> None:
         if not self.current_thread_id or not self.current_turn_id:

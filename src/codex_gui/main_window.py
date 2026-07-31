@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QDateTime, QElapsedTimer, QEvent, QObject, QProcess, QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QCloseEvent, QDesktopServices, QDragEnterEvent, QDropEvent, QIcon, QKeyEvent, QPixmap, QResizeEvent, QTextCursor
+from PySide6.QtGui import QColor, QCloseEvent, QDesktopServices, QDragEnterEvent, QDropEvent, QIcon, QKeyEvent, QPixmap, QResizeEvent, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -57,6 +57,49 @@ class QueuedMessage:
     effort: str | None
     access_mode: AccessMode
     collaboration_mode: str | None
+    queue_syntax: str | None = None
+
+
+@dataclass(slots=True)
+class QueuedCommand:
+    name: str
+    arguments: str = ""
+
+    @property
+    def syntax(self) -> str:
+        return f"/{self.name}" + (f" {self.arguments}" if self.arguments else "")
+
+
+@dataclass(slots=True, frozen=True)
+class SlashCommand:
+    name: str
+    description: str
+    accepts_arguments: bool = False
+    needs_thread: bool = False
+
+    @property
+    def syntax(self) -> str:
+        return f"/{self.name}"
+
+
+SLASH_COMMANDS = (
+    SlashCommand("compact", "Сжать историю текущего чата", needs_thread=True),
+    SlashCommand(
+        "review",
+        "Проверить изменения или выполнить ревью по инструкции",
+        accepts_arguments=True,
+        needs_thread=True,
+    ),
+    SlashCommand("fork", "Создать копию текущего чата и открыть её", needs_thread=True),
+    SlashCommand(
+        "plan",
+        "Переключиться в Plan Mode или отправить запрос на планирование",
+        accepts_arguments=True,
+    ),
+    SlashCommand("new", "Создать новый чат в текущей рабочей папке"),
+    SlashCommand("help", "Показать полный список slash-команд"),
+)
+SLASH_COMMANDS_BY_NAME = {command.name: command for command in SLASH_COMMANDS}
 
 
 def format_duration(milliseconds: int) -> str:
@@ -119,6 +162,10 @@ class Composer(QTextEdit):
 
     sendRequested = Signal()
     filesDropped = Signal(list)
+    slashNavigate = Signal(int)
+    slashComplete = Signal()
+    slashActivate = Signal()
+    slashDismiss = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -131,6 +178,12 @@ class Composer(QTextEdit):
         self.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
         self.document().documentLayout().documentSizeChanged.connect(self._adjust_height)
         self.setFixedHeight(self.MIN_HEIGHT)
+        self._slash_menu_visible = False
+        self._slash_has_selection = False
+
+    def set_slash_menu_state(self, visible: bool, has_selection: bool) -> None:
+        self._slash_menu_visible = visible
+        self._slash_has_selection = has_selection
 
     def _adjust_height(self, _size: Any = None) -> None:
         document_height = int(self.document().size().height())
@@ -143,6 +196,26 @@ class Composer(QTextEdit):
         )
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
+        if self._slash_menu_visible:
+            if event.key() == Qt.Key.Key_Up:
+                self.slashNavigate.emit(-1)
+                return
+            if event.key() == Qt.Key.Key_Down:
+                self.slashNavigate.emit(1)
+                return
+            if event.key() == Qt.Key.Key_Tab:
+                self.slashComplete.emit()
+                return
+            if event.key() == Qt.Key.Key_Escape:
+                self.slashDismiss.emit()
+                return
+            if (
+                event.key() in {Qt.Key.Key_Return, Qt.Key.Key_Enter}
+                and event.modifiers() == Qt.KeyboardModifier.NoModifier
+                and self._slash_has_selection
+            ):
+                self.slashActivate.emit()
+                return
         if event.key() in {Qt.Key.Key_Return, Qt.Key.Key_Enter} and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             self.sendRequested.emit()
             return
@@ -161,6 +234,84 @@ class Composer(QTextEdit):
             event.acceptProposedAction()
         else:
             super().dropEvent(event)
+
+
+class SlashCommandPanel(QFrame):
+    commandActivated = Signal(str)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("slashCommandPanel")
+        self.setMaximumWidth(860)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(7, 7, 7, 7)
+        layout.setSpacing(0)
+        self.list = QListWidget()
+        self.list.setObjectName("slashCommandList")
+        self.list.setFrameShape(QFrame.Shape.NoFrame)
+        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.list.setSpacing(1)
+        self.list.itemClicked.connect(self._item_clicked)
+        layout.addWidget(self.list)
+        self.setVisible(False)
+
+    def set_commands(
+        self,
+        commands: list[tuple[SlashCommand, bool, str]],
+    ) -> None:
+        previous = self.selected_command()
+        self.list.clear()
+        first_enabled: QListWidgetItem | None = None
+        selected: QListWidgetItem | None = None
+        for command, available, reason in commands:
+            detail = command.description
+            if reason:
+                detail += f" · {reason}"
+            item = QListWidgetItem(f"{command.syntax}\n{detail}")
+            item.setData(Qt.ItemDataRole.UserRole, command.name)
+            item.setData(int(Qt.ItemDataRole.UserRole) + 1, available)
+            item.setSizeHint(QSize(0, 48))
+            if available:
+                if first_enabled is None:
+                    first_enabled = item
+                if command.name == previous:
+                    selected = item
+            else:
+                item.setForeground(QColor("#666b67"))
+                item.setToolTip(reason)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEnabled & ~Qt.ItemFlag.ItemIsSelectable)
+            self.list.addItem(item)
+        target = selected or first_enabled
+        if target is not None:
+            self.list.setCurrentItem(target)
+        self.list.setFixedHeight(min(300, max(52, len(commands) * 50 + 4)))
+
+    def selected_command(self) -> str | None:
+        item = self.list.currentItem()
+        if item is None or not bool(item.data(int(Qt.ItemDataRole.UserRole) + 1)):
+            return None
+        return str(item.data(Qt.ItemDataRole.UserRole))
+
+    def move_selection(self, delta: int) -> None:
+        if not self.list.count():
+            return
+        current = self.list.currentRow()
+        for offset in range(1, self.list.count() + 1):
+            row = (current + delta * offset) % self.list.count()
+            item = self.list.item(row)
+            if bool(item.data(int(Qt.ItemDataRole.UserRole) + 1)):
+                self.list.setCurrentItem(item)
+                return
+
+    def activate_selected(self) -> None:
+        command = self.selected_command()
+        if command:
+            self.commandActivated.emit(command)
+
+    def _item_clicked(self, item: QListWidgetItem) -> None:
+        if bool(item.data(int(Qt.ItemDataRole.UserRole) + 1)):
+            self.commandActivated.emit(str(item.data(Qt.ItemDataRole.UserRole)))
 
 
 class MessageCard(QFrame):
@@ -655,12 +806,16 @@ class MainWindow(QMainWindow):
         self._current_approval: tuple[object, str, str] | None = None
         self._user_input_queue: list[tuple[object, dict[str, Any]]] = []
         self._current_user_input: tuple[object, dict[str, Any]] | None = None
-        self._message_queue: list[QueuedMessage] = []
+        self._message_queue: list[QueuedMessage | QueuedCommand] = []
+        self._queue_paused = False
+        self._queue_action_pending = False
         self._turn_active = False
         self._turn_timer = QElapsedTimer()
         self._active_collaboration_mode: str | None = None
         self._thinking_indicator: ThinkingIndicator | None = None
         self._pending_plan_text = ""
+        self._slash_dismissed_text: str | None = None
+        self._slash_help_visible = False
         self._auto_follow = True
         self._danger_acknowledged = False
         self._closing = False
@@ -882,6 +1037,9 @@ class MainWindow(QMainWindow):
             Qt.AlignmentFlag.AlignLeft,
         )
 
+        self.slash_panel = SlashCommandPanel()
+        composer_area_layout.addWidget(self.slash_panel)
+
         self.attachment_row = QHBoxLayout()
         self.attachment_row.addStretch(1)
         composer_panel_layout.addLayout(self.attachment_row)
@@ -1004,9 +1162,15 @@ class MainWindow(QMainWindow):
         self.project_combo.currentIndexChanged.connect(self._project_changed)
         self.composer.filesDropped.connect(self._add_attachments)
         self.composer.sendRequested.connect(self._send)
+        self.composer.textChanged.connect(self._composer_text_changed)
+        self.composer.slashNavigate.connect(self._navigate_slash_commands)
+        self.composer.slashComplete.connect(self._complete_slash_command)
+        self.composer.slashActivate.connect(self.slash_panel.activate_selected)
+        self.composer.slashDismiss.connect(self._dismiss_slash_panel)
+        self.slash_panel.commandActivated.connect(self._activate_slash_command)
         self.send_button.clicked.connect(self._send)
         self.stop_button.clicked.connect(self.service.interrupt)
-        self.queue_resume_button.clicked.connect(self._send_next_queued)
+        self.queue_resume_button.clicked.connect(self._resume_queue)
         self.queue_clear_button.clicked.connect(self._clear_message_queue)
         self.model_combo.currentIndexChanged.connect(self._model_changed)
         self.effort_combo.currentIndexChanged.connect(self._effort_changed)
@@ -1033,6 +1197,9 @@ class MainWindow(QMainWindow):
         self.service.approvalRequested.connect(self._approval_requested)
         self.service.userInputRequested.connect(self._user_input_requested)
         self.service.serverRequestResolved.connect(self._server_request_resolved)
+        current_thread_changed = getattr(self.service, "currentThreadChanged", None)
+        if current_thread_changed is not None:
+            current_thread_changed.connect(lambda _thread_id: self._update_slash_panel())
 
     def _load_settings(self) -> None:
         for path in self.settings.projects:
@@ -1132,18 +1299,24 @@ class MainWindow(QMainWindow):
         return True
 
     def _new_chat(self) -> None:
+        self._prepare_new_chat(clear_queue=True)
+
+    def _prepare_new_chat(self, clear_queue: bool) -> bool:
         if not self.service.current_project:
             self._add_project()
             if not self.service.current_project:
-                return
+                return False
         self.service.prepare_new_thread()
-        self._clear_message_queue()
+        if clear_queue:
+            self._clear_message_queue()
         self._reset_context_usage()
         self.thread_list.clearSelection()
         self.chat_title.setText("Новый чат")
         self.chat_context.setText(self.service.current_project or "Рабочая папка не выбрана")
         self._clear_timeline("Новый чат готов. Опишите задачу ниже.")
         self.composer.setFocus()
+        self._update_slash_panel()
+        return True
 
     def _set_models(self, models: list[ModelInfo]) -> None:
         self.models = models
@@ -1214,6 +1387,87 @@ class MainWindow(QMainWindow):
                 3500,
             )
 
+    def _composer_text_changed(self) -> None:
+        text = self.composer.toPlainText()
+        if self._slash_dismissed_text is not None and text != self._slash_dismissed_text:
+            self._slash_dismissed_text = None
+        self._slash_help_visible = False
+        self._update_slash_panel()
+
+    def _matching_slash_commands(self) -> list[tuple[SlashCommand, bool, str]]:
+        text = self.composer.toPlainText()
+        if self._slash_help_visible and not text:
+            prefix = "/"
+        else:
+            if not text.startswith("/") or any(character.isspace() for character in text):
+                return []
+            if text == self._slash_dismissed_text:
+                return []
+            prefix = text
+        has_thread = bool(getattr(self.service, "current_thread_id", ""))
+        matches: list[tuple[SlashCommand, bool, str]] = []
+        for command in SLASH_COMMANDS:
+            if not command.syntax.startswith(prefix):
+                continue
+            available = not command.needs_thread or has_thread
+            reason = "" if available else "Сначала создайте текущий чат"
+            matches.append((command, available, reason))
+        return matches
+
+    def _update_slash_panel(self) -> None:
+        matches = self._matching_slash_commands()
+        self.slash_panel.set_commands(matches)
+        visible = bool(matches)
+        self.slash_panel.setVisible(visible)
+        self.composer.set_slash_menu_state(
+            visible,
+            self.slash_panel.selected_command() is not None,
+        )
+
+    def _navigate_slash_commands(self, delta: int) -> None:
+        self.slash_panel.move_selection(delta)
+        self.composer.set_slash_menu_state(
+            not self.slash_panel.isHidden(),
+            self.slash_panel.selected_command() is not None,
+        )
+
+    def _complete_slash_command(self) -> None:
+        selected = self.slash_panel.selected_command()
+        if not selected:
+            return
+        command = SLASH_COMMANDS_BY_NAME[selected]
+        completion = command.syntax + (" " if command.accepts_arguments else "")
+        self.composer.setPlainText(completion)
+        cursor = self.composer.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.composer.setTextCursor(cursor)
+
+    def _dismiss_slash_panel(self) -> None:
+        self._slash_dismissed_text = self.composer.toPlainText()
+        self._slash_help_visible = False
+        self.slash_panel.setVisible(False)
+        self.composer.set_slash_menu_state(False, False)
+
+    def _activate_slash_command(self, name: str) -> None:
+        self._execute_slash_command(name, "", f"/{name}")
+
+    def _show_slash_help(self) -> None:
+        self.composer.clear()
+        self._slash_dismissed_text = None
+        self._slash_help_visible = True
+        self._update_slash_panel()
+        self.composer.setFocus()
+
+    @staticmethod
+    def _parse_slash_command(text: str) -> tuple[str, str] | None:
+        if not text.startswith("/"):
+            return None
+        token, separator, arguments = text.partition(" ")
+        name = token[1:]
+        if name not in SLASH_COMMANDS_BY_NAME:
+            return None
+        return name, arguments.strip() if separator else ""
+
     def _choose_attachments(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(self, "Прикрепить файлы")
         self._add_attachments(paths)
@@ -1258,6 +1512,52 @@ class MainWindow(QMainWindow):
         text = self.composer.toPlainText().strip()
         if not text and not self.attachments:
             return
+        slash = self._parse_slash_command(text)
+        if slash is not None:
+            name, arguments = slash
+            self._execute_slash_command(name, arguments, text)
+            return
+        self._submit_message(text)
+
+    def _execute_slash_command(self, name: str, arguments: str, syntax: str) -> None:
+        command = SLASH_COMMANDS_BY_NAME[name]
+        if command.needs_thread and not getattr(self.service, "current_thread_id", ""):
+            self.statusBar().showMessage("Команда недоступна: сначала создайте текущий чат", 5000)
+            return
+        if name == "help":
+            self._show_slash_help()
+            return
+        if name == "plan" and not arguments:
+            self.composer.clear()
+            self._dismiss_slash_panel()
+            index = self.access_combo.findData(PLAN_MODE_VALUE)
+            if index >= 0:
+                self.access_combo.setCurrentIndex(index)
+            return
+        if name == "plan":
+            self._submit_message(arguments, force_plan=True, queue_syntax=syntax)
+            return
+
+        self.composer.clear()
+        self._dismiss_slash_panel()
+        queued = QueuedCommand(name, arguments)
+        if self._turn_active or self._queue_action_pending or not self.plan_confirmation_card.isHidden():
+            self._message_queue.append(queued)
+            self._render_message_queue()
+            self.statusBar().showMessage(
+                f"Команда добавлена в очередь · {len(self._message_queue)}",
+                4000,
+            )
+            return
+        self._dispatch_command(queued)
+
+    def _submit_message(
+        self,
+        text: str,
+        *,
+        force_plan: bool = False,
+        queue_syntax: str | None = None,
+    ) -> None:
         invalid = [str(item.path) for item in self.attachments if not item.path.is_file()]
         if invalid:
             self._show_error("Файлы больше не существуют:\n" + "\n".join(invalid))
@@ -1271,7 +1571,11 @@ class MainWindow(QMainWindow):
         self.attachments.clear()
         self._render_attachments()
         selected_mode = str(self.access_combo.currentData())
-        collaboration_mode = PLAN_MODE_VALUE if selected_mode == PLAN_MODE_VALUE else None
+        collaboration_mode = (
+            PLAN_MODE_VALUE
+            if force_plan or selected_mode == PLAN_MODE_VALUE
+            else None
+        )
         if collaboration_mode:
             access_mode = AccessMode.READ_ONLY
         else:
@@ -1286,8 +1590,9 @@ class MainWindow(QMainWindow):
             self.effort_combo.currentData(),
             access_mode,
             collaboration_mode,
+            queue_syntax,
         )
-        if self._turn_active:
+        if self._turn_active or self._queue_action_pending:
             self._message_queue.append(message)
             self._render_message_queue()
             self.statusBar().showMessage(
@@ -1299,11 +1604,13 @@ class MainWindow(QMainWindow):
             self._dismiss_plan_confirmation(send_queued=False)
         self._dispatch_message(message)
 
-    def _dispatch_message(self, message: QueuedMessage) -> None:
+    def _dispatch_message(self, message: QueuedMessage) -> bool:
         missing = [str(item.path) for item in message.attachments if not item.path.is_file()]
         if missing:
             self._show_error("Файлы из очереди больше не существуют:\n" + "\n".join(missing))
-            return
+            self._queue_paused = True
+            self._render_message_queue()
+            return False
         self._active_collaboration_mode = message.collaboration_mode
         self.service.send_message(
             message.text,
@@ -1313,15 +1620,51 @@ class MainWindow(QMainWindow):
             message.access_mode,
             message.collaboration_mode,
         )
+        return True
+
+    def _dispatch_command(self, command: QueuedCommand) -> None:
+        if command.name == "compact":
+            self.service.compact_thread()
+            return
+        if command.name == "review":
+            self.service.start_review(command.arguments)
+            return
+        if command.name == "fork":
+            self._queue_action_pending = True
+            self._render_message_queue()
+            self.service.fork_thread(self._fork_finished)
+            return
+        if command.name == "new":
+            if not self._prepare_new_chat(clear_queue=False):
+                self._queue_paused = True
+                self._render_message_queue()
+                return
+            QTimer.singleShot(0, self._send_next_queued)
+
+    def _fork_finished(self, success: bool) -> None:
+        self._queue_action_pending = False
+        if not success:
+            self._queue_paused = True
+        self._render_message_queue()
+        if success:
+            QTimer.singleShot(0, self._send_next_queued)
 
     def _send_next_queued(self) -> None:
-        if self._turn_active or not self._message_queue:
+        if self._turn_active or self._queue_action_pending or self._queue_paused or not self._message_queue:
             return
         if not self.plan_confirmation_card.isHidden() or not self.user_input_card.isHidden():
             return
-        message = self._message_queue.pop(0)
+        queued = self._message_queue.pop(0)
         self._render_message_queue()
-        self._dispatch_message(message)
+        if isinstance(queued, QueuedCommand):
+            self._dispatch_command(queued)
+        else:
+            self._dispatch_message(queued)
+
+    def _resume_queue(self) -> None:
+        self._queue_paused = False
+        self._render_message_queue()
+        self._send_next_queued()
 
     def _remove_queued_message(self, index: int) -> None:
         if 0 <= index < len(self._message_queue):
@@ -1330,6 +1673,7 @@ class MainWindow(QMainWindow):
 
     def _clear_message_queue(self) -> None:
         self._message_queue.clear()
+        self._queue_paused = False
         self._render_message_queue()
 
     def _render_message_queue(self) -> None:
@@ -1338,9 +1682,13 @@ class MainWindow(QMainWindow):
             if item.widget():
                 item.widget().deleteLater()
         count = len(self._message_queue)
-        self.queue_label.setText(f"ОЧЕРЕДЬ  ·  {count}")
-        for index, message in enumerate(self._message_queue):
-            preview = " ".join(message.text.split()) or "Вложения"
+        state = "ПРИОСТАНОВЛЕНА" if self._queue_paused else "ОЧЕРЕДЬ"
+        self.queue_label.setText(f"{state}  ·  {count}")
+        for index, queued in enumerate(self._message_queue):
+            if isinstance(queued, QueuedCommand):
+                preview = queued.syntax
+            else:
+                preview = queued.queue_syntax or " ".join(queued.text.split()) or "Вложения"
             if len(preview) > 90:
                 preview = preview[:87] + "…"
             button = QToolButton()
@@ -1352,7 +1700,9 @@ class MainWindow(QMainWindow):
                 lambda _checked=False, target=index: self._remove_queued_message(target)
             )
             self.queue_items_layout.addWidget(button)
-        self.queue_resume_button.setEnabled(bool(count) and not self._turn_active)
+        self.queue_resume_button.setEnabled(
+            bool(count) and not self._turn_active and not self._queue_action_pending
+        )
         self.queue_panel.setVisible(bool(count))
 
     def _selected_model(self) -> ModelInfo | None:
@@ -1472,6 +1822,24 @@ class MainWindow(QMainWindow):
             paths = [str(change.get("path", "")) for change in changes if isinstance(change, dict)]
             diffs = [str(change.get("diff", "")) for change in changes if isinstance(change, dict)]
             self._activity(item_id, "Изменения файлов: " + ", ".join(paths), "\n".join(diffs))
+        elif kind == "contextCompaction":
+            self._activity(
+                item_id,
+                "Контекст сжат",
+                self._compact_item(item) or "История чата сжата для продолжения работы.",
+            )
+        elif kind == "enteredReviewMode":
+            self._activity(
+                item_id,
+                "Режим ревью запущен",
+                self._compact_item(item) or "Codex проверяет выбранные изменения.",
+            )
+        elif kind == "exitedReviewMode":
+            self._activity(
+                item_id,
+                "Режим ревью завершён",
+                self._compact_item(item) or "Codex завершил проверку изменений.",
+            )
         elif kind in {"mcpToolCall", "dynamicToolCall", "webSearch", "collabToolCall"}:
             title = str(item.get("tool") or item.get("query") or item.get("type"))
             self._activity(item_id, title, self._compact_item(item))
@@ -1609,7 +1977,11 @@ class MainWindow(QMainWindow):
                 self._show_desktop_notification("Codex", "Выполнение запроса остановлено")
             else:
                 self._show_desktop_notification("Codex", "Выполнение запроса завершено")
-            if status not in {"failed", "interrupted", "cancelled", "canceled"}:
+            if status in {"failed", "interrupted", "cancelled", "canceled"}:
+                if self._message_queue:
+                    self._queue_paused = True
+                    self._render_message_queue()
+            else:
                 if self._pending_plan_text:
                     self.plan_confirmation_card.setVisible(True)
                 else:

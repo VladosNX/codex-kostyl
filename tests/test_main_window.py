@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QByteArray, QObject, Signal
+from pathlib import Path
+
+from PySide6.QtCore import QByteArray, QObject, Qt, Signal
 from PySide6.QtWidgets import QLabel, QMessageBox, QWidget
 
-from codex_gui.main_window import MainWindow
-from codex_gui.models import PLAN_MODE_VALUE, AccessMode, ModelInfo
+from codex_gui.main_window import MainWindow, QueuedCommand
+from codex_gui.models import PLAN_MODE_VALUE, AccessMode, Attachment, ModelInfo
 
 
 class FakeService(QObject):
@@ -27,14 +29,41 @@ class FakeService(QObject):
     approvalRequested = Signal(object, str, dict)
     userInputRequested = Signal(object, dict)
     serverRequestResolved = Signal(object)
+    currentThreadChanged = Signal(str)
 
     def __init__(self) -> None:
         super().__init__()
         self.account = None
         self.sent: list[tuple] = []
+        self.actions: list[tuple[str, str]] = []
+        self.current_project = "/repo"
+        self.current_thread_id = ""
+        self.current_turn_id = ""
 
     def send_message(self, *args) -> None:
         self.sent.append(args)
+        self.actions.append(("message", str(args[0])))
+
+    def compact_thread(self) -> None:
+        self.actions.append(("compact", ""))
+        self.turnStateChanged.emit("starting")
+
+    def start_review(self, instructions: str = "") -> None:
+        self.actions.append(("review", instructions))
+        self.turnStateChanged.emit("starting")
+
+    def fork_thread(self, callback=None) -> None:
+        source = self.current_thread_id
+        self.actions.append(("fork", source))
+        self.current_thread_id = "thr_fork"
+        self.currentThreadChanged.emit(self.current_thread_id)
+        if callback:
+            callback(True)
+
+    def prepare_new_thread(self) -> None:
+        self.actions.append(("new", self.current_thread_id))
+        self.current_thread_id = ""
+        self.currentThreadChanged.emit("")
 
     def interrupt(self) -> None:
         pass
@@ -230,3 +259,225 @@ def test_project_selector_is_in_prompt_bubble_not_sidebar(qtbot) -> None:
     assert sidebar.isAncestorOf(window.project_combo) is False
     assert composer_panel is not None
     assert composer_panel.isAncestorOf(window.project_bubble) is False
+    composer_area_layout = composer_panel.parentWidget().layout()
+    assert composer_area_layout.indexOf(window.project_bubble) < composer_area_layout.indexOf(window.slash_panel)
+    assert composer_area_layout.indexOf(window.slash_panel) < composer_area_layout.indexOf(composer_panel)
+
+
+def test_slash_panel_appears_filters_and_shows_unavailable_reason(qtbot) -> None:
+    window, _service = make_window(qtbot)
+
+    window.composer.setPlainText("/")
+    assert window.slash_panel.isHidden() is False
+    assert window.slash_panel.list.count() == 6
+    compact = window.slash_panel.list.item(0)
+    assert compact.text().startswith("/compact\n")
+    assert "Сначала создайте текущий чат" in compact.text()
+    assert compact.flags() & Qt.ItemFlag.ItemIsEnabled == Qt.ItemFlag.NoItemFlags
+
+    window.composer.setPlainText("/re")
+    assert window.slash_panel.list.count() == 1
+    assert window.slash_panel.list.item(0).data(Qt.ItemDataRole.UserRole) == "review"
+
+    window.composer.setPlainText("/review инструкция")
+    assert window.slash_panel.isHidden() is True
+
+
+def test_slash_panel_keyboard_tab_enter_escape_and_click(qtbot) -> None:
+    window, service = make_window(qtbot)
+    service.current_thread_id = "thr_source"
+    window.show()
+
+    window.composer.setPlainText("/")
+    assert window.slash_panel.selected_command() == "compact"
+    qtbot.keyClick(window.composer, Qt.Key.Key_Down)
+    assert window.slash_panel.selected_command() == "review"
+    qtbot.keyClick(window.composer, Qt.Key.Key_Up)
+    assert window.slash_panel.selected_command() == "compact"
+
+    window.composer.setPlainText("/rev")
+    qtbot.keyClick(window.composer, Qt.Key.Key_Tab)
+    assert window.composer.toPlainText() == "/review "
+    assert window.slash_panel.isHidden() is True
+
+    window.composer.setPlainText("/co")
+    qtbot.keyClick(window.composer, Qt.Key.Key_Return)
+    assert service.actions[-1] == ("compact", "")
+    assert window.composer.toPlainText() == ""
+    window._turn_state("completed")
+
+    window.composer.setPlainText("/")
+    qtbot.keyClick(window.composer, Qt.Key.Key_Escape)
+    assert window.slash_panel.isHidden() is True
+
+    window.composer.setPlainText("/fo")
+    item = window.slash_panel.list.item(0)
+    rect = window.slash_panel.list.visualItemRect(item)
+    qtbot.mouseClick(
+        window.slash_panel.list.viewport(),
+        Qt.MouseButton.LeftButton,
+        pos=rect.center(),
+    )
+    assert service.actions[-1] == ("fork", "thr_source")
+    assert service.current_thread_id == "thr_fork"
+
+
+def test_help_clears_command_and_shows_full_list(qtbot) -> None:
+    window, _service = make_window(qtbot)
+    window.composer.setPlainText("/help")
+
+    window._send()
+
+    assert window.composer.toPlainText() == ""
+    assert window.slash_panel.isHidden() is False
+    assert window.slash_panel.list.count() == 6
+
+
+def test_unknown_slash_and_absolute_path_are_regular_prompts(qtbot) -> None:
+    window, service = make_window(qtbot)
+    window.composer.setPlainText("/unknown")
+    assert window.slash_panel.isHidden() is True
+    qtbot.keyClick(window.composer, Qt.Key.Key_Return)
+    assert "\n" in window.composer.toPlainText()
+
+    window.composer.setPlainText("/unknown argument")
+    window._send()
+    window.composer.setPlainText("/home/user/project")
+    window._send()
+
+    assert [call[0] for call in service.sent[-2:]] == [
+        "/unknown argument",
+        "/home/user/project",
+    ]
+
+
+def test_plan_without_text_switches_immediately_and_preserves_attachments(qtbot, tmp_path) -> None:
+    window, _service = make_window(qtbot)
+    attachment_path = tmp_path / "notes.txt"
+    attachment_path.write_text("notes")
+    window.attachments.append(Attachment(Path(attachment_path), False))
+    window._render_attachments()
+    window._turn_state("inProgress")
+    window.composer.setPlainText("/plan")
+
+    window._send()
+
+    assert window.access_combo.currentData() == PLAN_MODE_VALUE
+    assert window.composer.toPlainText() == ""
+    assert [item.path for item in window.attachments] == [attachment_path]
+    assert window._message_queue == []
+
+
+def test_plan_with_prompt_supports_attachments_and_queues_while_active(qtbot, tmp_path) -> None:
+    window, service = make_window(qtbot)
+    attachment_path = tmp_path / "plan.md"
+    attachment_path.write_text("context")
+    window.attachments.append(Attachment(Path(attachment_path), False))
+    window._render_attachments()
+    window._turn_state("inProgress")
+    window.composer.setPlainText("/plan Подготовь миграцию")
+
+    window._send()
+
+    queued = window._message_queue[0]
+    assert not isinstance(queued, QueuedCommand)
+    assert queued.text == "Подготовь миграцию"
+    assert queued.collaboration_mode == PLAN_MODE_VALUE
+    assert queued.queue_syntax == "/plan Подготовь миграцию"
+    assert queued.attachments[0].path == attachment_path
+    assert window.attachments == []
+    assert service.sent == []
+
+
+def test_action_command_preserves_selected_attachments(qtbot, tmp_path) -> None:
+    window, service = make_window(qtbot)
+    service.current_thread_id = "thr_1"
+    attachment_path = tmp_path / "keep.txt"
+    attachment_path.write_text("keep")
+    attachment = Attachment(Path(attachment_path), False)
+    window.attachments.append(attachment)
+    window._render_attachments()
+    window.composer.setPlainText("/review проверь API")
+
+    window._send()
+
+    assert service.actions[-1] == ("review", "проверь API")
+    assert window.attachments == [attachment]
+
+
+def test_mixed_message_and_command_queue_is_strict_fifo(qtbot) -> None:
+    window, service = make_window(qtbot)
+    service.current_thread_id = "thr_1"
+    window._turn_state("inProgress")
+    for text in ("первое", "/compact", "второе"):
+        window.composer.setPlainText(text)
+        window._send()
+
+    assert isinstance(window._message_queue[1], QueuedCommand)
+    assert "/compact" in window.queue_items_layout.itemAt(1).widget().text()
+    window._turn_state("completed")
+    qtbot.waitUntil(lambda: service.actions == [("message", "первое")])
+    window._turn_state("inProgress")
+    window._turn_state("completed")
+    qtbot.waitUntil(lambda: service.actions[-1] == ("compact", ""))
+    assert window._turn_active is True
+    window._turn_state("completed")
+    qtbot.waitUntil(lambda: service.actions[-1] == ("message", "второе"))
+
+    assert service.actions == [
+        ("message", "первое"),
+        ("compact", ""),
+        ("message", "второе"),
+    ]
+
+
+def test_queue_stops_after_command_error_and_keeps_remaining_items(qtbot) -> None:
+    window, service = make_window(qtbot)
+    service.current_thread_id = "thr_1"
+    window._turn_state("inProgress")
+    for text in ("/compact", "после ошибки"):
+        window.composer.setPlainText(text)
+        window._send()
+
+    window._turn_state("completed")
+    qtbot.waitUntil(lambda: service.actions == [("compact", "")])
+    window._turn_state("failed")
+    qtbot.wait(10)
+
+    assert window._queue_paused is True
+    assert len(window._message_queue) == 1
+    assert service.sent == []
+    assert "ПРИОСТАНОВЛЕНА" in window.queue_label.text()
+
+    window._resume_queue()
+    assert service.sent[-1][0] == "после ошибки"
+
+
+def test_new_command_uses_current_project_and_keeps_fifo_queue(qtbot) -> None:
+    window, service = make_window(qtbot)
+    service.current_thread_id = "thr_1"
+    window._turn_state("inProgress")
+    for text in ("/new", "сообщение нового чата"):
+        window.composer.setPlainText(text)
+        window._send()
+
+    window._turn_state("completed")
+    qtbot.waitUntil(lambda: len(service.actions) >= 1)
+    assert service.actions[0] == ("new", "thr_1")
+    qtbot.waitUntil(lambda: service.sent[-1][0] == "сообщение нового чата")
+    assert service.current_project == "/repo"
+
+
+def test_compaction_and_review_events_render_as_action_cards(qtbot) -> None:
+    window, _service = make_window(qtbot)
+    events = (
+        ("contextCompaction", "Контекст сжат"),
+        ("enteredReviewMode", "Режим ревью запущен"),
+        ("exitedReviewMode", "Режим ревью завершён"),
+    )
+    for index, (kind, _title) in enumerate(events):
+        window._upsert_item({"id": f"event_{index}", "type": kind}, True)
+
+    assert [window.cards[f"event_{index}"].toggle.text() for index in range(3)] == [
+        title for _kind, title in events
+    ]
