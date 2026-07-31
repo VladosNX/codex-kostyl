@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+app_exec="@APP_EXEC@"
+
+if [[ ! -x "$app_exec" ]]; then
+    printf 'Codex Kostyl is not installed correctly: %s is missing.\n' "$app_exec" >&2
+    exit 1
+fi
+
+# Desktop sessions often do not inherit PATH additions made by a user's shell.
+# Keep the current environment when Codex is already visible, otherwise use a
+# login shell so installations made through npm/nvm and ~/.local/bin are found.
+if command -v codex >/dev/null 2>&1; then
+    exec "$app_exec" "$@"
+fi
+
+login_shell="${SHELL:-/bin/sh}"
+if [[ -x "$login_shell" ]]; then
+    exec "$login_shell" -lc 'app_exec=$1; shift; exec "$app_exec" "$@"' codex-kostyl "$app_exec" "$@"
+fi
+
+exec "$app_exec" "$@"

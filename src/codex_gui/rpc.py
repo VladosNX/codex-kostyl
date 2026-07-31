@@ -1,0 +1,166 @@
+from __future__ import annotations
+
+import json
+from collections.abc import Callable
+from typing import Any
+
+from PySide6.QtCore import QObject, QProcess, Signal
+
+RpcCallback = Callable[[Any | None, dict[str, Any] | None], None]
+
+
+class JsonLineDecoder:
+    """Incrementally decode UTF-8 JSON objects separated by newlines."""
+
+    def __init__(self) -> None:
+        self._buffer = bytearray()
+
+    def feed(self, chunk: bytes) -> tuple[list[dict[str, Any]], list[str]]:
+        self._buffer.extend(chunk)
+        messages: list[dict[str, Any]] = []
+        errors: list[str] = []
+        while b"\n" in self._buffer:
+            raw, _, rest = self._buffer.partition(b"\n")
+            self._buffer = bytearray(rest)
+            if not raw.strip():
+                continue
+            try:
+                value = json.loads(raw)
+                if not isinstance(value, dict):
+                    raise ValueError("JSON-RPC message is not an object")
+                messages.append(value)
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                errors.append(f"Некорректное сообщение app-server: {exc}")
+        return messages, errors
+
+
+class CodexProcess(QObject):
+    messageReceived = Signal(dict)
+    stderrReceived = Signal(str)
+    protocolError = Signal(str)
+    started = Signal()
+    stopped = Signal(int, str)
+
+    def __init__(self, codex_path: str = "codex", parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self.codex_path = codex_path
+        self.process = QProcess(self)
+        self.process.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
+        self.process.readyReadStandardOutput.connect(self._read_stdout)
+        self.process.readyReadStandardError.connect(self._read_stderr)
+        self.process.started.connect(self.started)
+        self.process.finished.connect(self._finished)
+        self.process.errorOccurred.connect(self._process_error)
+        self._decoder = JsonLineDecoder()
+
+    def start(self) -> None:
+        if self.process.state() != QProcess.ProcessState.NotRunning:
+            return
+        self._decoder = JsonLineDecoder()
+        self.process.setProgram(self.codex_path)
+        self.process.setArguments(["app-server", "--stdio"])
+        self.process.start()
+
+    def stop(self) -> None:
+        if self.process.state() == QProcess.ProcessState.NotRunning:
+            return
+        # PySide can invoke Python slots re-entrantly from waitForFinished().
+        # During application teardown that caused a reproducible SIGSEGV in the
+        # QProcess.finished -> Python signal bridge. No lifecycle notification is
+        # needed after the main window has committed to closing, so block the
+        # process signals before the synchronous shutdown.
+        self.process.blockSignals(True)
+        self.process.terminate()
+        if not self.process.waitForFinished(1500):
+            self.process.kill()
+            self.process.waitForFinished(500)
+
+    def send(self, payload: dict[str, Any]) -> None:
+        if self.process.state() == QProcess.ProcessState.NotRunning:
+            raise RuntimeError("Codex app-server не запущен")
+        wire = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
+        self.process.write(wire)
+
+    def _read_stdout(self) -> None:
+        messages, errors = self._decoder.feed(bytes(self.process.readAllStandardOutput()))
+        for error in errors:
+            self.protocolError.emit(error)
+        for message in messages:
+            self.messageReceived.emit(message)
+
+    def _read_stderr(self) -> None:
+        text = bytes(self.process.readAllStandardError()).decode("utf-8", errors="replace")
+        if text:
+            self.stderrReceived.emit(text.rstrip())
+
+    def _finished(self, exit_code: int, exit_status: QProcess.ExitStatus) -> None:
+        self.stopped.emit(exit_code, exit_status.name)
+
+    def _process_error(self, error: QProcess.ProcessError) -> None:
+        self.protocolError.emit(f"Ошибка запуска Codex: {error.name}: {self.process.errorString()}")
+
+
+class JsonRpcClient(QObject):
+    notification = Signal(str, dict)
+    serverRequest = Signal(object, str, dict)
+    protocolError = Signal(str)
+    initialized = Signal(dict)
+
+    def __init__(self, transport: CodexProcess, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self.transport = transport
+        self._next_id = 1
+        self._pending: dict[int, RpcCallback] = {}
+        transport.messageReceived.connect(self._on_message)
+        transport.protocolError.connect(self.protocolError)
+
+    def initialize(self) -> None:
+        self.request(
+            "initialize",
+            {
+                "clientInfo": {
+                    "name": "codex_kostyl",
+                    "title": "Codex Kostyl",
+                    "version": "0.1.0",
+                },
+                "capabilities": {"experimentalApi": True},
+            },
+            self._initialized,
+        )
+
+    def request(self, method: str, params: dict[str, Any], callback: RpcCallback | None = None) -> int:
+        request_id = self._next_id
+        self._next_id += 1
+        self._pending[request_id] = callback or (lambda _result, _error: None)
+        self.transport.send({"method": method, "id": request_id, "params": params})
+        return request_id
+
+    def notify(self, method: str, params: dict[str, Any]) -> None:
+        self.transport.send({"method": method, "params": params})
+
+    def respond(self, request_id: object, result: Any) -> None:
+        self.transport.send({"id": request_id, "result": result})
+
+    def respond_error(self, request_id: object, code: int, message: str) -> None:
+        self.transport.send({"id": request_id, "error": {"code": code, "message": message}})
+
+    def _initialized(self, result: Any | None, error: dict[str, Any] | None) -> None:
+        if error:
+            self.protocolError.emit(error.get("message", "Не удалось инициализировать app-server"))
+            return
+        self.notify("initialized", {})
+        self.initialized.emit(result if isinstance(result, dict) else {})
+
+    def _on_message(self, message: dict[str, Any]) -> None:
+        if "method" in message and "id" in message:
+            self.serverRequest.emit(message["id"], str(message["method"]), message.get("params", {}))
+            return
+        if "method" in message:
+            self.notification.emit(str(message["method"]), message.get("params", {}))
+            return
+        request_id = message.get("id")
+        callback = self._pending.pop(request_id, None)
+        if callback is None:
+            self.protocolError.emit(f"Ответ на неизвестный запрос: {request_id}")
+            return
+        callback(message.get("result"), message.get("error"))

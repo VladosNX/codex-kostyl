@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Codex Kostyl
+Name[ru]=Codex Kostyl
+GenericName=Codex GUI
+GenericName[ru]=Графический клиент Codex
+Comment=Native Linux GUI for Codex CLI
+Comment[ru]=Графический клиент Codex CLI для Linux
+Exec=/usr/local/bin/codex-kostyl
+Icon=codex-kostyl
+Terminal=false
+Categories=Development;IDE;
+Keywords=Codex;OpenAI;AI;Programming;
+StartupNotify=true
+StartupWMClass=codex-kostyl

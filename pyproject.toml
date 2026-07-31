@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "codex-kostyl"
+version = "0.1.0"
+description = "A native Linux GUI for Codex CLI"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+  "PySide6>=6.7",
+  "markdown-it-py>=3.0",
+  "Pygments>=2.18",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.0",
+  "pytest-qt>=4.4",
+]
+
+[project.scripts]
+codex-kostyl = "codex_gui.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/codex_gui"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
