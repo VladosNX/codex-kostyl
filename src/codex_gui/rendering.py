@@ -13,6 +13,7 @@ class MarkdownRenderer:
     def __init__(self) -> None:
         self._formatter = HtmlFormatter(nowrap=True)
         self._md = MarkdownIt("commonmark", {"html": False, "linkify": True, "breaks": True})
+        self._md.enable("table")
         self._md.options["highlight"] = self._highlight
 
     def _highlight(self, code: str, language: str, _attrs: str = "") -> str:
@@ -34,6 +35,10 @@ class MarkdownRenderer:
           a {{ color: #a8c7b1; text-decoration: none; }}
           blockquote {{ color: #a8ada8; border-left: 3px solid #54655a; margin-left: 3px; padding-left: 11px; }}
           li {{ margin: 3px 0; }}
+          table {{ border-collapse: collapse; margin: 9px 0 12px 0; }}
+          th, td {{ border: 1px solid #424844; padding: 6px 9px; vertical-align: top; }}
+          th {{ color: #f0f1ed; background: #292d2b; font-weight: 600; }}
+          td {{ color: #d6d9d4; background: #1c1f1e; }}
         </style>{body}
         """
 
