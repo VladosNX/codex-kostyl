@@ -65,17 +65,24 @@ class ModelInfo:
 
     @classmethod
     def from_wire(cls, data: dict[str, Any]) -> "ModelInfo":
+        raw_efforts = data.get("supportedReasoningEfforts", [])
+        if not isinstance(raw_efforts, list):
+            raw_efforts = []
         efforts = [
             str(item.get("reasoningEffort", item.get("effort", "")))
-            for item in data.get("supportedReasoningEfforts", [])
+            for item in raw_efforts
+            if isinstance(item, dict)
         ]
         efforts = [value for value in efforts if value]
+        raw_modalities = data.get("inputModalities", ["text"])
+        if not isinstance(raw_modalities, list):
+            raw_modalities = ["text"]
         return cls(
             id=str(data.get("model") or data.get("id") or ""),
             display_name=str(data.get("displayName") or data.get("model") or data.get("id") or ""),
             efforts=efforts,
             default_effort=data.get("defaultReasoningEffort"),
-            modalities=set(data.get("inputModalities", ["text", "image"])),
+            modalities={str(value) for value in raw_modalities if value},
             is_default=bool(data.get("isDefault")),
         )
 
@@ -97,11 +104,15 @@ class ThreadSummary:
         raw_status = data.get("status", "notLoaded")
         if isinstance(raw_status, dict):
             raw_status = raw_status.get("type", "active")
+        try:
+            updated_at = int(data.get("updatedAt") or data.get("createdAt") or 0)
+        except (TypeError, ValueError, OverflowError):
+            updated_at = 0
         return cls(
             id=str(data.get("id", "")),
             title=title,
             cwd=str(data.get("cwd") or ""),
-            updated_at=int(data.get("updatedAt") or data.get("createdAt") or 0),
+            updated_at=updated_at,
             status=str(raw_status),
         )
 

@@ -16,14 +16,24 @@ class AppSettings:
         raw = self._settings.value("projects", [])
         if isinstance(raw, str):
             raw = [raw]
-        return [str(Path(value).resolve()) for value in raw if Path(value).is_dir()]
+        if not isinstance(raw, (list, tuple)):
+            return []
+        projects: list[str] = []
+        for value in raw:
+            if not isinstance(value, (str, Path)):
+                continue
+            path = Path(value).expanduser()
+            if path.is_dir():
+                projects.append(str(path.resolve()))
+        return list(dict.fromkeys(projects))
 
     @projects.setter
     def projects(self, values: list[str]) -> None:
         self._settings.setValue("projects", list(dict.fromkeys(values)))
 
     def get(self, key: str, default: str = "") -> str:
-        return str(self._settings.value(key, default))
+        value = self._settings.value(key, default)
+        return default if value is None else str(value)
 
     def set(self, key: str, value: object) -> None:
         self._settings.setValue(key, value)
@@ -46,5 +56,8 @@ class AppSettings:
     def restore_geometry(self) -> tuple[QByteArray, QByteArray]:
         geometry = self._settings.value("geometry", QByteArray())
         state = self._settings.value("window_state", QByteArray())
+        if not isinstance(geometry, QByteArray):
+            geometry = QByteArray()
+        if not isinstance(state, QByteArray):
+            state = QByteArray()
         return geometry, state
-

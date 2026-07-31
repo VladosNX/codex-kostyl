@@ -6,6 +6,8 @@ from typing import Any
 
 from PySide6.QtCore import QObject, QProcess, Signal
 
+from . import __version__
+
 RpcCallback = Callable[[Any | None, dict[str, Any] | None], None]
 
 
@@ -22,16 +24,33 @@ class JsonLineDecoder:
         while b"\n" in self._buffer:
             raw, _, rest = self._buffer.partition(b"\n")
             self._buffer = bytearray(rest)
-            if not raw.strip():
-                continue
-            try:
-                value = json.loads(raw)
-                if not isinstance(value, dict):
-                    raise ValueError("JSON-RPC message is not an object")
-                messages.append(value)
-            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-                errors.append(f"Некорректное сообщение app-server: {exc}")
+            self._decode_line(raw, messages, errors)
         return messages, errors
+
+    def finish(self) -> tuple[list[dict[str, Any]], list[str]]:
+        """Decode a final non-newline-terminated message at transport EOF."""
+        messages: list[dict[str, Any]] = []
+        errors: list[str] = []
+        raw = bytes(self._buffer)
+        self._buffer.clear()
+        self._decode_line(raw, messages, errors)
+        return messages, errors
+
+    @staticmethod
+    def _decode_line(
+        raw: bytes,
+        messages: list[dict[str, Any]],
+        errors: list[str],
+    ) -> None:
+        if not raw.strip():
+            return
+        try:
+            value = json.loads(raw)
+            if not isinstance(value, dict):
+                raise ValueError("JSON-RPC message is not an object")
+            messages.append(value)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            errors.append(f"Некорректное сообщение app-server: {exc}")
 
 
 class CodexProcess(QObject):
@@ -57,6 +76,7 @@ class CodexProcess(QObject):
         if self.process.state() != QProcess.ProcessState.NotRunning:
             return
         self._decoder = JsonLineDecoder()
+        self.process.blockSignals(False)
         self.process.setProgram(self.codex_path)
         self.process.setArguments(["app-server", "--stdio"])
         self.process.start()
@@ -94,6 +114,15 @@ class CodexProcess(QObject):
             self.stderrReceived.emit(text.rstrip())
 
     def _finished(self, exit_code: int, exit_status: QProcess.ExitStatus) -> None:
+        # QProcess normally emits readyRead first, but explicitly drain both
+        # channels so a short final diagnostic or JSON response is not lost.
+        self._read_stdout()
+        self._read_stderr()
+        messages, errors = self._decoder.finish()
+        for error in errors:
+            self.protocolError.emit(error)
+        for message in messages:
+            self.messageReceived.emit(message)
         self.stopped.emit(exit_code, exit_status.name)
 
     def _process_error(self, error: QProcess.ProcessError) -> None:
@@ -105,6 +134,7 @@ class JsonRpcClient(QObject):
     serverRequest = Signal(object, str, dict)
     protocolError = Signal(str)
     initialized = Signal(dict)
+    disconnected = Signal()
 
     def __init__(self, transport: CodexProcess, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -113,6 +143,9 @@ class JsonRpcClient(QObject):
         self._pending: dict[int, RpcCallback] = {}
         transport.messageReceived.connect(self._on_message)
         transport.protocolError.connect(self.protocolError)
+        stopped = getattr(transport, "stopped", None)
+        if stopped is not None:
+            stopped.connect(self._transport_stopped)
 
     def initialize(self) -> None:
         self.request(
@@ -121,7 +154,7 @@ class JsonRpcClient(QObject):
                 "clientInfo": {
                     "name": "codex_kostyl",
                     "title": "Codex Kostyl",
-                    "version": "0.1.0",
+                    "version": __version__,
                 },
                 "capabilities": {"experimentalApi": True},
             },
@@ -132,7 +165,11 @@ class JsonRpcClient(QObject):
         request_id = self._next_id
         self._next_id += 1
         self._pending[request_id] = callback or (lambda _result, _error: None)
-        self.transport.send({"method": method, "id": request_id, "params": params})
+        try:
+            self.transport.send({"method": method, "id": request_id, "params": params})
+        except Exception:
+            self._pending.pop(request_id, None)
+            raise
         return request_id
 
     def notify(self, method: str, params: dict[str, Any]) -> None:
@@ -152,15 +189,34 @@ class JsonRpcClient(QObject):
         self.initialized.emit(result if isinstance(result, dict) else {})
 
     def _on_message(self, message: dict[str, Any]) -> None:
+        raw_params = message.get("params", {})
+        params = raw_params if isinstance(raw_params, dict) else {}
+        if "method" in message and not isinstance(raw_params, dict):
+            self.protocolError.emit("Некорректные параметры JSON-RPC сообщения")
         if "method" in message and "id" in message:
-            self.serverRequest.emit(message["id"], str(message["method"]), message.get("params", {}))
+            self.serverRequest.emit(message["id"], str(message["method"]), params)
             return
         if "method" in message:
-            self.notification.emit(str(message["method"]), message.get("params", {}))
+            self.notification.emit(str(message["method"]), params)
             return
         request_id = message.get("id")
-        callback = self._pending.pop(request_id, None)
+        try:
+            callback = self._pending.pop(request_id, None)
+        except TypeError:
+            callback = None
         if callback is None:
             self.protocolError.emit(f"Ответ на неизвестный запрос: {request_id}")
             return
-        callback(message.get("result"), message.get("error"))
+        raw_error = message.get("error")
+        error = raw_error if isinstance(raw_error, dict) else None
+        if raw_error is not None and error is None:
+            error = {"message": str(raw_error)}
+        try:
+            callback(message.get("result"), error)
+        except Exception as exc:
+            self.protocolError.emit(f"Ошибка обработки ответа app-server: {exc}")
+
+    def _transport_stopped(self, _exit_code: int, _status: str) -> None:
+        # Responses from the old process can never arrive after a restart.
+        self._pending.clear()
+        self.disconnected.emit()

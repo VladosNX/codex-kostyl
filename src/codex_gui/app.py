@@ -6,7 +6,6 @@ import subprocess
 import sys
 from importlib.resources import files
 
-from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -165,15 +164,16 @@ def codex_preflight() -> tuple[str | None, str | None]:
     if not path:
         return None, "Codex CLI не найден в PATH. Установите Codex и перезапустите приложение."
     try:
-        output = subprocess.run(
+        completed = subprocess.run(
             [path, "--version"],
             capture_output=True,
             text=True,
             timeout=5,
             check=True,
-        ).stdout
+        )
     except (OSError, subprocess.SubprocessError) as exc:
         return None, f"Не удалось проверить Codex CLI: {exc}"
+    output = completed.stdout.strip() or completed.stderr.strip()
     match = re.search(r"(\d+)\.(\d+)\.(\d+)", output)
     if not match:
         return None, f"Не удалось определить версию Codex: {output.strip()}"
@@ -192,7 +192,10 @@ def main() -> int:
     app.setOrganizationName("CodexKostyl")
     app.setWindowIcon(QIcon(str(files("codex_gui").joinpath("assets/codex-kostyl.svg"))))
     app.setStyle("Fusion")
-    app.setFont(QFont("Inter, Noto Sans, DejaVu Sans", 10))
+    font = QFont()
+    font.setFamilies(["Inter", "Noto Sans", "DejaVu Sans"])
+    font.setPointSize(10)
+    app.setFont(font)
     app.setStyleSheet(STYLE)
     logger = configure_diagnostics()
 

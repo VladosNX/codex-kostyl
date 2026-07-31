@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -38,22 +39,26 @@ class CodexService(QObject):
         self.current_thread_id = ""
         self.current_turn_id = ""
         self.current_thread_ready = False
+        self._turn_start_pending = False
         self._resuming: set[str] = set()
-        self._after_resume: dict[str, list[Any]] = {}
+        self._after_resume: dict[str, list[Callable[[], None]]] = {}
         self._thread_list_generation = 0
         self.models: list[ModelInfo] = []
         self.account: dict[str, Any] | None = None
         self.connected = False
-        self._thread_defaults: dict[str, Any] = {}
 
         rpc.initialized.connect(self._bootstrap)
         rpc.notification.connect(self._notification)
         rpc.serverRequest.connect(self._server_request)
         rpc.protocolError.connect(self.errorOccurred)
+        disconnected = getattr(rpc, "disconnected", None)
+        if disconnected is not None:
+            disconnected.connect(self._disconnected)
 
     def _bootstrap(self, _result: dict[str, Any]) -> None:
         self.connected = True
         self.current_turn_id = ""
+        self._turn_start_pending = False
         self.turnStateChanged.emit("idle")
         self.refresh_account()
         self.refresh_models()
@@ -124,7 +129,13 @@ class CodexService(QObject):
             self._emit_rpc_error(error)
             return
         rows = result.get("data", []) if isinstance(result, dict) else []
-        self.models = [ModelInfo.from_wire(row) for row in rows if not row.get("hidden", False)]
+        if not isinstance(rows, list):
+            rows = []
+        self.models = [
+            ModelInfo.from_wire(row)
+            for row in rows
+            if isinstance(row, dict) and not row.get("hidden", False)
+        ]
         self.modelsUpdated.emit(self.models)
 
     def set_project(self, path: str) -> None:
@@ -139,14 +150,20 @@ class CodexService(QObject):
         if not self.connected:
             return
         self._thread_list_generation += 1
-        self._fetch_threads_page(self._thread_list_generation, None, [])
+        self._fetch_threads_page(self._thread_list_generation, None, [], set())
 
     def _fetch_threads_page(
         self,
         generation: int,
         cursor: str | None,
         collected: list[ThreadSummary],
+        seen_cursors: set[str],
     ) -> None:
+        if cursor:
+            if cursor in seen_cursors:
+                self.errorOccurred.emit("Codex вернул повторяющийся курсор списка чатов")
+                return
+            seen_cursors.add(cursor)
         params: dict[str, Any] = {
             "limit": 100,
             "sortKey": "recency_at",
@@ -163,10 +180,19 @@ class CodexService(QObject):
                 return
             payload = result if isinstance(result, dict) else {}
             rows = payload.get("data", [])
-            collected.extend(ThreadSummary.from_wire(row) for row in rows)
+            if not isinstance(rows, list):
+                rows = []
+            collected.extend(
+                ThreadSummary.from_wire(row) for row in rows if isinstance(row, dict)
+            )
             next_cursor = payload.get("nextCursor")
             if next_cursor:
-                self._fetch_threads_page(generation, str(next_cursor), collected)
+                self._fetch_threads_page(
+                    generation,
+                    str(next_cursor),
+                    collected,
+                    seen_cursors,
+                )
             else:
                 self.threadsUpdated.emit(collected)
 
@@ -182,9 +208,9 @@ class CodexService(QObject):
         self.current_thread_id = thread_id
         self.current_thread_ready = False
         self.currentThreadChanged.emit(thread_id)
-        self._resume_thread(lambda: self._read_current_thread())
+        self._resume_thread(lambda: self._read_thread(thread_id))
 
-    def _resume_thread(self, after_resume: Any | None = None) -> None:
+    def _resume_thread(self, after_resume: Callable[[], None] | None = None) -> None:
         if not self.current_thread_id:
             return
         thread_id = self.current_thread_id
@@ -197,10 +223,13 @@ class CodexService(QObject):
         def resumed(_result: Any, error: dict[str, Any] | None) -> None:
             self._resuming.discard(thread_id)
             callbacks = self._after_resume.pop(thread_id, [])
-            if error:
-                self._emit_rpc_error(error)
-                return
             if self.current_thread_id != thread_id:
+                return
+            if error:
+                if self._turn_start_pending:
+                    self._turn_start_pending = False
+                    self.turnStateChanged.emit("failed")
+                self._emit_rpc_error(error)
                 return
             self.current_thread_ready = True
             for callback in callbacks:
@@ -211,18 +240,31 @@ class CodexService(QObject):
             params["cwd"] = self.current_project
         self.rpc.request("thread/resume", params, resumed)
 
-    def _read_current_thread(self) -> None:
+    def _read_thread(self, thread_id: str) -> None:
         self.rpc.request(
             "thread/read",
-            {"threadId": self.current_thread_id, "includeTurns": True},
-            self._thread_read,
+            {"threadId": thread_id, "includeTurns": True},
+            lambda result, error: self._thread_read(thread_id, result, error),
         )
 
-    def _thread_read(self, result: Any, error: dict[str, Any] | None) -> None:
+    def _thread_read(
+        self,
+        thread_id: str,
+        result: Any,
+        error: dict[str, Any] | None,
+    ) -> None:
+        if self.current_thread_id != thread_id:
+            return
         if error:
             self._emit_rpc_error(error)
             return
         thread = result.get("thread", {}) if isinstance(result, dict) else {}
+        if not isinstance(thread, dict):
+            thread = {}
+        result_thread_id = str(thread.get("id", ""))
+        if result_thread_id and result_thread_id != thread_id:
+            self.errorOccurred.emit("Codex вернул данные другого чата")
+            return
         self.threadLoaded.emit(thread)
 
     def new_thread(
@@ -230,10 +272,13 @@ class CodexService(QObject):
         model: str,
         effort: str | None,
         access_mode: AccessMode,
-        after_created: Any | None = None,
+        after_created: Callable[[], None] | None = None,
         collaboration_mode: str | None = None,
     ) -> None:
         if not self.current_project:
+            if after_created:
+                self._turn_start_pending = False
+                self.turnStateChanged.emit("failed")
             self.errorOccurred.emit("Сначала выберите рабочую папку")
             return
         params: dict[str, Any] = {
@@ -244,19 +289,32 @@ class CodexService(QObject):
         }
         if model:
             params["model"] = model
-        self._thread_defaults = {
-            "model": model,
-            "effort": effort,
-            "access": access_mode,
-            "collaboration_mode": collaboration_mode,
-        }
+        project = self.current_project
 
         def done(result: Any, error: dict[str, Any] | None) -> None:
             if error:
+                if after_created:
+                    self._turn_start_pending = False
+                    self.turnStateChanged.emit("failed")
                 self._emit_rpc_error(error)
                 return
             thread = result.get("thread", {}) if isinstance(result, dict) else {}
-            self.current_thread_id = str(thread.get("id", ""))
+            if not isinstance(thread, dict):
+                thread = {}
+            thread_id = str(thread.get("id", ""))
+            if not thread_id:
+                if after_created:
+                    self._turn_start_pending = False
+                    self.turnStateChanged.emit("failed")
+                self.errorOccurred.emit("Codex не вернул идентификатор нового чата")
+                return
+            if self.current_project != project or self.current_thread_id:
+                self.rpc.request("thread/unsubscribe", {"threadId": thread_id})
+                if after_created:
+                    self._turn_start_pending = False
+                    self.turnStateChanged.emit("failed")
+                return
+            self.current_thread_id = thread_id
             self.current_thread_ready = True
             self.currentThreadChanged.emit(self.current_thread_id)
             self.threadLoaded.emit(thread)
@@ -289,6 +347,8 @@ class CodexService(QObject):
         collaboration_mode: str | None = None,
     ) -> None:
         if not self.current_thread_id:
+            self._turn_start_pending = True
+            self.turnStateChanged.emit("starting")
             self.new_thread(
                 model,
                 effort,
@@ -305,6 +365,8 @@ class CodexService(QObject):
             )
             return
         if not self.current_thread_ready:
+            self._turn_start_pending = True
+            self.turnStateChanged.emit("starting")
             self._resume_thread(
                 lambda: self.send_message(
                     text,
@@ -329,6 +391,10 @@ class CodexService(QObject):
             "approvalPolicy": access_mode.approval_policy,
             "sandboxPolicy": access_mode.sandbox_policy(self.current_project),
         }
+        if model:
+            params["model"] = model
+        if effort:
+            params["effort"] = effort
         params["collaborationMode"] = {
             "mode": PLAN_MODE_VALUE if collaboration_mode == PLAN_MODE_VALUE else "default",
             "settings": {
@@ -337,17 +403,20 @@ class CodexService(QObject):
                 "developer_instructions": None,
             },
         }
+        self._turn_start_pending = True
         self.turnStateChanged.emit("starting")
 
         def started(result: Any, error: dict[str, Any] | None) -> None:
             if error:
+                self._turn_start_pending = False
                 self.turnStateChanged.emit("failed")
                 self._emit_rpc_error(error)
                 return
             turn = result.get("turn", {}) if isinstance(result, dict) else {}
             turn_id = str(turn.get("id", ""))
-            if turn_id:
+            if turn_id and self._turn_start_pending:
                 self.current_turn_id = turn_id
+                self._turn_start_pending = False
 
         self.rpc.request("turn/start", params, started)
 
@@ -381,17 +450,20 @@ class CodexService(QObject):
         )
 
     def _start_action_turn(self, method: str, params: dict[str, Any]) -> None:
+        self._turn_start_pending = True
         self.turnStateChanged.emit("starting")
 
         def started(result: Any, error: dict[str, Any] | None) -> None:
             if error:
+                self._turn_start_pending = False
                 self.turnStateChanged.emit("failed")
                 self._emit_rpc_error(error)
                 return
             turn = result.get("turn", {}) if isinstance(result, dict) else {}
             turn_id = str(turn.get("id", ""))
-            if turn_id:
+            if turn_id and self._turn_start_pending:
                 self.current_turn_id = turn_id
+                self._turn_start_pending = False
 
         self.rpc.request(method, params, started)
 
@@ -459,7 +531,34 @@ class CodexService(QObject):
             lambda _result, error: self._emit_rpc_error(error) if error else None,
         )
 
-    def answer_approval(self, request_id: object, decision: str) -> None:
+    def answer_approval(
+        self,
+        request_id: object,
+        decision: str,
+        method: str = "",
+        params: dict[str, Any] | None = None,
+    ) -> None:
+        if method == "item/permissions/requestApproval":
+            if decision == "cancel":
+                self.cancel_server_request(request_id)
+                return
+            requested = (params or {}).get("permissions", {})
+            permissions: dict[str, Any] = {}
+            if decision in {"accept", "acceptForSession"} and isinstance(
+                requested, dict
+            ):
+                for key in ("network", "fileSystem"):
+                    value = requested.get(key)
+                    if isinstance(value, dict):
+                        permissions[key] = value
+            self.rpc.respond(
+                request_id,
+                {
+                    "permissions": permissions,
+                    "scope": "session" if decision == "acceptForSession" else "turn",
+                },
+            )
+            return
         self.rpc.respond(request_id, {"decision": decision})
 
     def answer_user_input(self, request_id: object, answers: dict[str, list[str]]) -> None:
@@ -485,48 +584,72 @@ class CodexService(QObject):
                 self.errorOccurred.emit(str(params.get("error", "Не удалось войти")))
             return
         if method == "thread/tokenUsage/updated":
-            thread_id = str(params.get("threadId", ""))
-            if not self.current_thread_id or thread_id == self.current_thread_id:
-                usage = params.get("tokenUsage", {})
-                if isinstance(usage, dict):
-                    self.tokenUsageUpdated.emit(usage)
+            if not self._is_current_thread_event(params):
+                return
+            usage = params.get("tokenUsage", {})
+            if isinstance(usage, dict):
+                self.tokenUsageUpdated.emit(usage)
             return
         if method == "turn/plan/updated":
-            turn_id = str(params.get("turnId", ""))
-            if not self.current_turn_id or turn_id == self.current_turn_id:
+            if self._is_current_turn_event(params):
                 self.turnPlanUpdated.emit(params)
             return
         if method == "turn/started":
+            if not self._is_current_thread_event(params):
+                return
             turn = params.get("turn", {})
+            if not isinstance(turn, dict):
+                return
             self.current_turn_id = str(turn.get("id", ""))
+            self._turn_start_pending = False
             self.turnStateChanged.emit("inProgress")
             return
         if method == "turn/completed":
+            if not self._is_current_turn_event(params):
+                return
             turn = params.get("turn", {})
+            if not isinstance(turn, dict):
+                return
             status = str(turn.get("status", "completed"))
             self.current_turn_id = ""
+            self._turn_start_pending = False
             self.turnStateChanged.emit(status)
             self.list_threads()
             self.refresh_rate_limits()
             if status == "failed":
                 error = turn.get("error") or {}
-                self.errorOccurred.emit(str(error.get("message", "Ход завершился ошибкой")))
+                message = (
+                    error.get("message", "Ход завершился ошибкой")
+                    if isinstance(error, dict)
+                    else error
+                )
+                self.errorOccurred.emit(str(message))
             return
         if method in {"item/started", "item/completed"}:
+            if not self._is_current_turn_event(params):
+                return
             item = params.get("item", {})
             if isinstance(item, dict):
                 self.itemUpdated.emit(item, method.endswith("completed"))
             return
         if method == "item/agentMessage/delta":
+            if not self._is_current_turn_event(params):
+                return
             self.agentDelta.emit(str(params.get("itemId", "")), str(params.get("delta", "")))
             return
         if method in {"item/reasoning/summaryTextDelta", "item/reasoning/textDelta"}:
+            if not self._is_current_turn_event(params):
+                return
             self.reasoningDelta.emit(str(params.get("itemId", "")), str(params.get("delta", "")))
             return
         if method == "item/commandExecution/outputDelta":
+            if not self._is_current_turn_event(params):
+                return
             self.commandDelta.emit(str(params.get("itemId", "")), str(params.get("delta", "")))
             return
         if method == "item/plan/delta":
+            if not self._is_current_turn_event(params):
+                return
             self.planDelta.emit(str(params.get("itemId", "")), str(params.get("delta", "")))
             return
         if method == "serverRequest/resolved":
@@ -534,7 +657,8 @@ class CodexService(QObject):
             return
         if method == "error":
             error = params.get("error", params)
-            self.errorOccurred.emit(str(error.get("message", "Ошибка Codex")))
+            message = error.get("message", "Ошибка Codex") if isinstance(error, dict) else error
+            self.errorOccurred.emit(str(message))
 
     def _server_request(self, request_id: object, method: str, params: dict[str, Any]) -> None:
         if method in {
@@ -552,3 +676,30 @@ class CodexService(QObject):
     def _emit_rpc_error(self, error: dict[str, Any] | None) -> None:
         if error:
             self.errorOccurred.emit(str(error.get("message", "Ошибка Codex")))
+
+    def _is_current_thread_event(self, params: dict[str, Any]) -> bool:
+        thread_id = str(params.get("threadId", ""))
+        return bool(self.current_thread_id) and (
+            not thread_id or thread_id == self.current_thread_id
+        )
+
+    def _is_current_turn_event(self, params: dict[str, Any]) -> bool:
+        if not self._is_current_thread_event(params):
+            return False
+        turn_id = str(params.get("turnId", ""))
+        if not turn_id:
+            turn = params.get("turn")
+            if isinstance(turn, dict):
+                turn_id = str(turn.get("id", ""))
+        return not self.current_turn_id or not turn_id or turn_id == self.current_turn_id
+
+    def _disconnected(self) -> None:
+        was_running = bool(self.current_turn_id) or self._turn_start_pending
+        self.connected = False
+        self.current_thread_ready = False
+        self.current_turn_id = ""
+        self._turn_start_pending = False
+        self._resuming.clear()
+        self._after_resume.clear()
+        if was_running:
+            self.turnStateChanged.emit("failed")

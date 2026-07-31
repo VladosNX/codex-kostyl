@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import QObject, Signal
 
-from codex_gui.models import AccessMode, Attachment
+from codex_gui.models import AccessMode
 from codex_gui.service import CodexService
 
 
@@ -71,7 +71,8 @@ def test_plan_mode_uses_collaboration_mode_and_read_only_sandbox(qtbot, tmp_path
             "developer_instructions": None,
         },
     }
-    assert "effort" not in params
+    assert params["model"] == "gpt-test"
+    assert params["effort"] == "high"
 
 
 def test_full_access_disables_command_approval_prompts(qtbot, tmp_path) -> None:
@@ -114,6 +115,45 @@ def test_approval_response_shape(qtbot) -> None:
     assert rpc.responses == [(7, {"decision": "acceptForSession"})]
 
 
+def test_permission_approval_uses_permission_response_schema(qtbot) -> None:
+    rpc = FakeRpc()
+    service = CodexService(rpc)  # type: ignore[arg-type]
+    params = {
+        "permissions": {
+            "network": {"enabled": True},
+            "fileSystem": {"read": ["/repo"], "write": None},
+            "unexpected": {"ignored": True},
+        }
+    }
+
+    service.answer_approval(
+        8,
+        "acceptForSession",
+        "item/permissions/requestApproval",
+        params,
+    )
+    service.answer_approval(
+        9,
+        "decline",
+        "item/permissions/requestApproval",
+        params,
+    )
+
+    assert rpc.responses == [
+        (
+            8,
+            {
+                "permissions": {
+                    "network": {"enabled": True},
+                    "fileSystem": {"read": ["/repo"], "write": None},
+                },
+                "scope": "session",
+            },
+        ),
+        (9, {"permissions": {}, "scope": "turn"}),
+    ]
+
+
 def test_opening_saved_thread_resumes_before_reading(qtbot) -> None:
     rpc = FakeRpc()
     service = CodexService(rpc)  # type: ignore[arg-type]
@@ -146,12 +186,14 @@ def test_rate_limits_refresh_after_completed_turn(qtbot) -> None:
     service = CodexService(rpc)  # type: ignore[arg-type]
     service.connected = True
     service.account = {"type": "chatgpt"}
+    service.current_thread_id = "thr_1"
+    service.current_turn_id = "turn_1"
     received = []
     service.rateLimitsUpdated.connect(received.append)
 
     rpc.notification.emit(
         "turn/completed",
-        {"turn": {"id": "turn_1", "status": "completed"}},
+        {"threadId": "thr_1", "turn": {"id": "turn_1", "status": "completed"}},
     )
     assert rpc.calls[-1] == ("account/rateLimits/read", {})
 
@@ -180,6 +222,8 @@ def test_server_request_resolution_is_forwarded_to_the_ui(qtbot) -> None:
 def test_context_usage_and_turn_plan_notifications_are_forwarded(qtbot) -> None:
     rpc = FakeRpc()
     service = CodexService(rpc)  # type: ignore[arg-type]
+    service.current_thread_id = "thread_1"
+    service.current_turn_id = "turn_1"
     usage_updates = []
     plan_updates = []
     service.tokenUsageUpdated.connect(usage_updates.append)
@@ -204,6 +248,88 @@ def test_context_usage_and_turn_plan_notifications_are_forwarded(qtbot) -> None:
 
     assert usage_updates == [usage]
     assert plan_updates == [plan]
+
+
+def test_notifications_from_another_thread_are_ignored(qtbot) -> None:
+    rpc = FakeRpc()
+    service = CodexService(rpc)  # type: ignore[arg-type]
+    service.current_thread_id = "current"
+    service.current_turn_id = "turn_current"
+    deltas = []
+    states = []
+    service.agentDelta.connect(lambda item_id, delta: deltas.append((item_id, delta)))
+    service.turnStateChanged.connect(states.append)
+
+    rpc.notification.emit(
+        "item/agentMessage/delta",
+        {
+            "threadId": "other",
+            "turnId": "turn_other",
+            "itemId": "message",
+            "delta": "wrong chat",
+        },
+    )
+    rpc.notification.emit(
+        "turn/completed",
+        {
+            "threadId": "other",
+            "turn": {"id": "turn_other", "status": "completed"},
+        },
+    )
+
+    assert deltas == []
+    assert states == []
+    assert service.current_turn_id == "turn_current"
+
+
+def test_stale_thread_read_does_not_replace_current_chat(qtbot) -> None:
+    rpc = FakeRpc()
+    service = CodexService(rpc)  # type: ignore[arg-type]
+    loaded = []
+    service.threadLoaded.connect(loaded.append)
+
+    service.open_thread("thread_a")
+    rpc.callbacks[0]({}, None)
+    assert rpc.calls[1][0] == "thread/read"
+    service.open_thread("thread_b")
+    rpc.callbacks[1]({"thread": {"id": "thread_a", "turns": []}}, None)
+
+    assert loaded == []
+    assert service.current_thread_id == "thread_b"
+
+
+def test_missing_new_thread_id_fails_instead_of_retrying_forever(qtbot, tmp_path) -> None:
+    rpc = FakeRpc()
+    service = CodexService(rpc)  # type: ignore[arg-type]
+    service.current_project = str(tmp_path)
+    states = []
+    errors = []
+    service.turnStateChanged.connect(states.append)
+    service.errorOccurred.connect(errors.append)
+
+    service.send_message("hello", [], "gpt-test", "high", AccessMode.WORKSPACE_WRITE)
+    assert states == ["starting"]
+    assert len(rpc.calls) == 1
+    assert rpc.calls[0][0] == "thread/start"
+    rpc.callbacks[0]({"thread": {}}, None)
+
+    assert states[-1] == "failed"
+    assert "идентификатор" in errors[-1]
+    assert len(rpc.calls) == 1
+
+
+def test_disconnect_fails_a_turn_that_is_still_starting(qtbot, tmp_path) -> None:
+    rpc = FakeRpc()
+    service = CodexService(rpc)  # type: ignore[arg-type]
+    service.current_project = str(tmp_path)
+    states = []
+    service.turnStateChanged.connect(states.append)
+
+    service.send_message("hello", [], "gpt-test", "high", AccessMode.WORKSPACE_WRITE)
+    service._disconnected()
+
+    assert states == ["starting", "failed"]
+    assert service._turn_start_pending is False
 
 
 def test_compact_review_and_custom_review_rpc_parameters(qtbot) -> None:

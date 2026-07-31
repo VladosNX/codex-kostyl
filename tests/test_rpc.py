@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-
 from PySide6.QtCore import QObject, QProcess, Signal
 
 from codex_gui.rpc import CodexProcess, JsonLineDecoder, JsonRpcClient
@@ -10,6 +8,7 @@ from codex_gui.rpc import CodexProcess, JsonLineDecoder, JsonRpcClient
 class FakeTransport(QObject):
     messageReceived = Signal(dict)
     protocolError = Signal(str)
+    stopped = Signal(int, str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -26,6 +25,14 @@ def test_json_line_decoder_handles_chunks_and_bad_lines() -> None:
     messages, errors = decoder.feed(b'{}}\nnot-json\n{"method":"ready","params":{}}\n')
     assert [message.get("id") for message in messages] == [1, None]
     assert len(errors) == 1
+
+
+def test_json_line_decoder_flushes_final_line_at_eof() -> None:
+    decoder = JsonLineDecoder()
+    assert decoder.feed(b'{"id":7,"result":{}}') == ([], [])
+    messages, errors = decoder.finish()
+    assert messages == [{"id": 7, "result": {}}]
+    assert errors == []
 
 
 def test_rpc_correlates_responses_and_routes_notifications(qtbot) -> None:
@@ -62,6 +69,20 @@ def test_rpc_accepts_response_when_callback_is_omitted(qtbot) -> None:
     request_id = rpc.request("thread/unsubscribe", {"threadId": "thr_1"})
     transport.messageReceived.emit({"id": request_id, "result": {}})
     assert errors == []
+
+
+def test_rpc_discards_pending_requests_when_transport_stops(qtbot) -> None:
+    transport = FakeTransport()
+    rpc = JsonRpcClient(transport)  # type: ignore[arg-type]
+    disconnected = []
+    rpc.disconnected.connect(lambda: disconnected.append(True))
+    request_id = rpc.request("model/list", {})
+
+    transport.stopped.emit(1, "CrashExit")
+    transport.messageReceived.emit({"id": request_id, "result": {}})
+
+    assert disconnected == [True]
+    assert rpc._pending == {}
 
 
 def test_process_stop_blocks_qprocess_signals_before_waiting(qtbot) -> None:

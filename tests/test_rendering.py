@@ -21,3 +21,10 @@ def test_markdown_renderer_renders_tables() -> None:
     assert "<td" in rendered
     assert "app.py" in rendered
     assert "border-collapse: collapse" in rendered
+
+
+def test_markdown_renderer_linkifies_urls_and_embeds_highlight_colors() -> None:
+    renderer = MarkdownRenderer()
+    assert '<a href="https://example.com">' in renderer.render("https://example.com")
+    highlighted = renderer.render("```python\nprint('ok')\n```")
+    assert "style=\"color:" in highlighted

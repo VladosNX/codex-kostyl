@@ -47,6 +47,21 @@ def test_model_and_thread_wire_parsing() -> None:
     assert thread.title == "Fix the bug"
 
 
+def test_wire_parsing_tolerates_malformed_optional_fields() -> None:
+    model = ModelInfo.from_wire(
+        {
+            "model": "gpt-test",
+            "supportedReasoningEfforts": None,
+            "inputModalities": "image",
+        }
+    )
+    thread = ThreadSummary.from_wire({"id": "thr_1", "updatedAt": "not-a-number"})
+
+    assert model.efforts == []
+    assert model.modalities == {"text"}
+    assert thread.updated_at == 0
+
+
 def test_weekly_rate_limit_is_selected_and_converted_to_remaining_percent() -> None:
     window = weekly_limit_from_payload(
         {

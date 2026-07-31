@@ -36,6 +36,7 @@ class FakeService(QObject):
         self.account = None
         self.sent: list[tuple] = []
         self.actions: list[tuple[str, str]] = []
+        self.approvals: list[tuple] = []
         self.current_project = "/repo"
         self.current_thread_id = ""
         self.current_turn_id = ""
@@ -67,6 +68,9 @@ class FakeService(QObject):
 
     def interrupt(self) -> None:
         pass
+
+    def answer_approval(self, *args) -> None:
+        self.approvals.append(args)
 
 
 class FakeSettings:
@@ -172,6 +176,19 @@ def test_turn_settings_remain_editable_and_are_captured_for_next_message(qtbot) 
     assert queued.collaboration_mode == PLAN_MODE_VALUE
 
 
+def test_unknown_saved_effort_falls_back_to_model_default(qtbot) -> None:
+    settings = FakeSettings()
+    settings.values["effort"] = "unsupported"
+    window, _service = make_window(qtbot, settings)
+
+    window._set_models(
+        [ModelInfo("model-a", "Model A", ["low", "high"], "high")]
+    )
+
+    assert window.effort_combo.currentData() == "high"
+    assert settings.values["effort"] == "high"
+
+
 def test_completed_turn_leaves_duration_in_timeline(qtbot) -> None:
     window, _service = make_window(qtbot)
     window._turn_state("starting")
@@ -186,6 +203,26 @@ def test_completed_turn_leaves_duration_in_timeline(qtbot) -> None:
     ]
     assert len(labels) == 1
     assert labels[0].text().startswith("Готово за ")
+
+
+def test_permission_prompt_shows_scope_and_preserves_response_context(qtbot) -> None:
+    window, service = make_window(qtbot)
+    params = {
+        "reason": "Нужен доступ к API",
+        "permissions": {"network": {"enabled": True}},
+    }
+
+    window._approval_requested(
+        42,
+        "item/permissions/requestApproval",
+        params,
+    )
+    assert "enabled" in window.approval_card.detail.text()
+    window._answer_inline_approval("acceptForSession")
+
+    assert service.approvals == [
+        (42, "acceptForSession", "item/permissions/requestApproval", params)
+    ]
 
 
 def test_context_usage_and_updated_plan_are_rendered(qtbot) -> None:
@@ -405,6 +442,24 @@ def test_action_command_preserves_selected_attachments(qtbot, tmp_path) -> None:
     assert window.attachments == [attachment]
 
 
+def test_send_without_project_preserves_draft_and_attachments(qtbot, tmp_path) -> None:
+    window, service = make_window(qtbot)
+    service.current_project = ""
+    attachment_path = tmp_path / "draft.txt"
+    attachment_path.write_text("draft")
+    attachment = Attachment(attachment_path, False)
+    window.attachments.append(attachment)
+    window._render_attachments()
+    window.composer.setPlainText("Не потеряй этот текст")
+    window._add_project = lambda: None  # type: ignore[method-assign]
+
+    window._send()
+
+    assert window.composer.toPlainText() == "Не потеряй этот текст"
+    assert window.attachments == [attachment]
+    assert service.sent == []
+
+
 def test_mixed_message_and_command_queue_is_strict_fifo(qtbot) -> None:
     window, service = make_window(qtbot)
     service.current_thread_id = "thr_1"
@@ -451,6 +506,40 @@ def test_queue_stops_after_command_error_and_keeps_remaining_items(qtbot) -> Non
 
     window._resume_queue()
     assert service.sent[-1][0] == "после ошибки"
+
+
+def test_queue_keeps_message_when_its_attachment_disappears(qtbot, tmp_path) -> None:
+    window, service = make_window(qtbot)
+    service.current_thread_id = "thr_1"
+    attachment_path = tmp_path / "queued.txt"
+    attachment_path.write_text("queued")
+    window._turn_state("inProgress")
+    window.attachments.append(Attachment(attachment_path, False))
+    window.composer.setPlainText("Сообщение с файлом")
+    window._send()
+    attachment_path.unlink()
+    window._show_error = lambda _message: None  # type: ignore[method-assign]
+
+    window._turn_state("completed")
+    qtbot.wait(20)
+
+    assert len(window._message_queue) == 1
+    assert window._queue_paused is True
+    assert service.sent == []
+
+
+def test_fork_blocks_navigation_until_callback(qtbot) -> None:
+    window, service = make_window(qtbot)
+    service.current_thread_id = "thr_1"
+    service.fork_thread = lambda _callback=None: None  # type: ignore[method-assign]
+    window.composer.setPlainText("/fork")
+
+    window._send()
+
+    assert window._queue_action_pending is True
+    assert window.new_chat_button.isEnabled() is False
+    assert window.thread_list.isEnabled() is False
+    assert window.project_combo.isEnabled() is False
 
 
 def test_new_command_uses_current_project_and_keeps_fifo_queue(qtbot) -> None:

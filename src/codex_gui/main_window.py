@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import mimetypes
 import uuid
 from dataclasses import dataclass
@@ -7,7 +8,19 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QDateTime, QElapsedTimer, QEvent, QObject, QProcess, QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QCloseEvent, QDesktopServices, QDragEnterEvent, QDropEvent, QIcon, QKeyEvent, QPixmap, QResizeEvent, QTextCursor
+from PySide6.QtGui import (
+    QColor,
+    QCloseEvent,
+    QDesktopServices,
+    QDragEnterEvent,
+    QDropEvent,
+    QIcon,
+    QImageReader,
+    QKeyEvent,
+    QPixmap,
+    QResizeEvent,
+    QTextCursor,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -68,6 +81,15 @@ class QueuedCommand:
     @property
     def syntax(self) -> str:
         return f"/{self.name}" + (f" {self.arguments}" if self.arguments else "")
+
+
+@dataclass(slots=True)
+class ApprovalPrompt:
+    request_id: object
+    method: str
+    params: dict[str, Any]
+    title: str
+    detail: str
 
 
 @dataclass(slots=True, frozen=True)
@@ -802,8 +824,8 @@ class MainWindow(QMainWindow):
         self.cards: dict[str, MessageCard | ActivityCard] = {}
         self._execution_plan_cards: dict[str, ExecutionPlanCard] = {}
         self._last_activity_group: ActivityGroupCard | None = None
-        self._approval_queue: list[tuple[object, str, str]] = []
-        self._current_approval: tuple[object, str, str] | None = None
+        self._approval_queue: list[ApprovalPrompt] = []
+        self._current_approval: ApprovalPrompt | None = None
         self._user_input_queue: list[tuple[object, dict[str, Any]]] = []
         self._current_user_input: tuple[object, dict[str, Any]] | None = None
         self._message_queue: list[QueuedMessage | QueuedCommand] = []
@@ -1234,7 +1256,13 @@ class MainWindow(QMainWindow):
             projects.append(path)
             self.settings.projects = projects
             index = self.project_combo.count() - 1
-        self.project_combo.setCurrentIndex(index)
+        if (
+            self.project_combo.currentIndex() == index
+            and getattr(self.service, "current_project", "") != path
+        ):
+            self._project_changed(index)
+        elif self.project_combo.currentIndex() != index:
+            self.project_combo.setCurrentIndex(index)
 
     def _project_changed(self, index: int) -> None:
         path = self.project_combo.itemData(index)
@@ -1339,12 +1367,19 @@ class MainWindow(QMainWindow):
         model = self.models[index]
         self.settings.set("model", model.id)
         saved_effort = self.settings.get("effort", model.default_effort or "")
+        self.effort_combo.blockSignals(True)
         self.effort_combo.clear()
         for effort in model.efforts:
             self.effort_combo.addItem(effort, effort)
         effort_index = self.effort_combo.findData(saved_effort)
+        if effort_index < 0 and model.default_effort:
+            effort_index = self.effort_combo.findData(model.default_effort)
         if effort_index >= 0:
             self.effort_combo.setCurrentIndex(effort_index)
+        elif self.effort_combo.count():
+            self.effort_combo.setCurrentIndex(0)
+        self.effort_combo.blockSignals(False)
+        self._effort_changed(self.effort_combo.currentIndex())
         self._note_next_request_setting()
 
     def _effort_changed(self, _index: int) -> None:
@@ -1493,9 +1528,15 @@ class MainWindow(QMainWindow):
             button.setText(f"{attachment.name}  ×")
             button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
             if attachment.is_image:
-                pixmap = QPixmap(str(attachment.path))
-                if not pixmap.isNull():
-                    button.setIcon(QIcon(pixmap.scaled(40, 40, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)))
+                reader = QImageReader(str(attachment.path))
+                reader.setAutoTransform(True)
+                size = reader.size()
+                if size.isValid():
+                    size.scale(40, 40, Qt.AspectRatioMode.KeepAspectRatio)
+                    reader.setScaledSize(size)
+                image = reader.read()
+                if not image.isNull():
+                    button.setIcon(QIcon(QPixmap.fromImage(image)))
                     button.setIconSize(QSize(40, 40))
             else:
                 button.setText(f"📄 {attachment.name}  ×")
@@ -1558,6 +1599,17 @@ class MainWindow(QMainWindow):
         force_plan: bool = False,
         queue_syntax: str | None = None,
     ) -> None:
+        if getattr(self.service, "connected", True) is False:
+            self._show_error("Codex app-server ещё не подключен")
+            return
+        if not getattr(self.service, "current_project", ""):
+            self._add_project()
+            if not getattr(self.service, "current_project", ""):
+                self.statusBar().showMessage(
+                    "Сообщение сохранено в редакторе — выберите рабочую папку",
+                    5000,
+                )
+                return
         invalid = [str(item.path) for item in self.attachments if not item.path.is_file()]
         if invalid:
             self._show_error("Файлы больше не существуют:\n" + "\n".join(invalid))
@@ -1605,6 +1657,11 @@ class MainWindow(QMainWindow):
         self._dispatch_message(message)
 
     def _dispatch_message(self, message: QueuedMessage) -> bool:
+        if getattr(self.service, "connected", True) is False:
+            self.statusBar().showMessage("Очередь приостановлена: Codex не подключен", 5000)
+            self._queue_paused = True
+            self._render_message_queue()
+            return False
         missing = [str(item.path) for item in message.attachments if not item.path.is_file()]
         if missing:
             self._show_error("Файлы из очереди больше не существуют:\n" + "\n".join(missing))
@@ -1654,12 +1711,15 @@ class MainWindow(QMainWindow):
             return
         if not self.plan_confirmation_card.isHidden() or not self.user_input_card.isHidden():
             return
-        queued = self._message_queue.pop(0)
-        self._render_message_queue()
+        queued = self._message_queue[0]
         if isinstance(queued, QueuedCommand):
+            self._message_queue.pop(0)
+            self._render_message_queue()
             self._dispatch_command(queued)
         else:
-            self._dispatch_message(queued)
+            if self._dispatch_message(queued):
+                self._message_queue.pop(0)
+                self._render_message_queue()
 
     def _resume_queue(self) -> None:
         self._queue_paused = False
@@ -1704,6 +1764,10 @@ class MainWindow(QMainWindow):
             bool(count) and not self._turn_active and not self._queue_action_pending
         )
         self.queue_panel.setVisible(bool(count))
+        navigation_enabled = not self._turn_active and not self._queue_action_pending
+        self.new_chat_button.setEnabled(navigation_enabled)
+        self.thread_list.setEnabled(navigation_enabled)
+        self.project_combo.setEnabled(navigation_enabled)
 
     def _selected_model(self) -> ModelInfo | None:
         model_id = self.model_combo.currentData()
@@ -1968,6 +2032,7 @@ class MainWindow(QMainWindow):
         self._render_message_queue()
         self.statusBar().showMessage("Codex работает…" if active else f"Ход: {status}", 4000)
         if was_active and not active:
+            self._clear_server_requests()
             elapsed_ms = self._turn_timer.elapsed() if self._turn_timer.isValid() else 0
             self._turn_timer.invalidate()
             self._add_turn_duration(status, elapsed_ms)
@@ -2200,8 +2265,19 @@ class MainWindow(QMainWindow):
             detail = f"Codex запрашивает разрешение на изменение файлов.\n\n{params.get('reason', '')}"
         else:
             title = "Дополнительные разрешения"
-            detail = f"Codex запрашивает дополнительные разрешения.\n\n{params.get('reason', '')}"
-        self._approval_queue.append((request_id, title, detail))
+            permissions = params.get("permissions", {})
+            rendered_permissions = (
+                json.dumps(permissions, ensure_ascii=False, indent=2)
+                if isinstance(permissions, dict)
+                else str(permissions)
+            )
+            detail = (
+                "Codex запрашивает дополнительные разрешения.\n\n"
+                f"{params.get('reason', '')}\n\nЗапрошено:\n{rendered_permissions}"
+            )
+        self._approval_queue.append(
+            ApprovalPrompt(request_id, method, params, title, detail)
+        )
         self._show_next_approval()
         summary = " ".join(detail.split())
         if len(summary) > 150:
@@ -2212,17 +2288,24 @@ class MainWindow(QMainWindow):
         if self._current_approval is not None or not self._approval_queue:
             return
         self._current_approval = self._approval_queue.pop(0)
-        _request_id, title, detail = self._current_approval
-        self.approval_card.set_request(title, detail)
+        self.approval_card.set_request(
+            self._current_approval.title,
+            self._current_approval.detail,
+        )
         self.approval_card.setVisible(True)
 
     def _answer_inline_approval(self, decision: str) -> None:
         if self._current_approval is None:
             return
-        request_id, _title, _detail = self._current_approval
+        prompt = self._current_approval
         self._current_approval = None
         self.approval_card.setVisible(False)
-        self.service.answer_approval(request_id, decision)
+        self.service.answer_approval(
+            prompt.request_id,
+            decision,
+            prompt.method,
+            prompt.params,
+        )
         self._show_next_approval()
 
     def _user_input_requested(self, request_id: object, params: dict[str, Any]) -> None:
@@ -2262,9 +2345,12 @@ class MainWindow(QMainWindow):
 
     def _server_request_resolved(self, request_id: object) -> None:
         self._approval_queue = [
-            item for item in self._approval_queue if item[0] != request_id
+            item for item in self._approval_queue if item.request_id != request_id
         ]
-        if self._current_approval is not None and self._current_approval[0] == request_id:
+        if (
+            self._current_approval is not None
+            and self._current_approval.request_id == request_id
+        ):
             self._current_approval = None
             self.approval_card.setVisible(False)
             self._show_next_approval()
@@ -2275,6 +2361,14 @@ class MainWindow(QMainWindow):
             self._current_user_input = None
             self.user_input_card.setVisible(False)
             self._show_next_user_input()
+
+    def _clear_server_requests(self) -> None:
+        self._approval_queue.clear()
+        self._current_approval = None
+        self.approval_card.setVisible(False)
+        self._user_input_queue.clear()
+        self._current_user_input = None
+        self.user_input_card.setVisible(False)
 
     def _implement_plan(self) -> None:
         self.plan_confirmation_card.setVisible(False)

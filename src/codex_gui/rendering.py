@@ -10,18 +10,20 @@ from pygments.util import ClassNotFound
 
 
 class MarkdownRenderer:
-    def __init__(self) -> None:
-        self._formatter = HtmlFormatter(nowrap=True)
-        self._md = MarkdownIt("commonmark", {"html": False, "linkify": True, "breaks": True})
-        self._md.enable("table")
-        self._md.options["highlight"] = self._highlight
+    # MarkdownIt and HtmlFormatter are immutable after configuration for this
+    # use case. Sharing them avoids rebuilding the parsing rules for every
+    # message card when a long thread is opened.
+    _formatter = HtmlFormatter(nowrap=True, noclasses=True)
+    _md = MarkdownIt("commonmark", {"html": False, "linkify": True, "breaks": True})
+    _md.enable(["table", "linkify"])
 
-    def _highlight(self, code: str, language: str, _attrs: str = "") -> str:
+    @staticmethod
+    def _highlight(code: str, language: str, _attrs: str = "") -> str:
         try:
             lexer = get_lexer_by_name(language) if language else TextLexer()
         except ClassNotFound:
             lexer = TextLexer()
-        return highlight(code, lexer, self._formatter)
+        return highlight(code, lexer, MarkdownRenderer._formatter)
 
     def render(self, text: str) -> str:
         body = self._md.render(text)
@@ -41,6 +43,9 @@ class MarkdownRenderer:
           td {{ color: #d6d9d4; background: #1c1f1e; }}
         </style>{body}
         """
+
+
+MarkdownRenderer._md.options["highlight"] = MarkdownRenderer._highlight
 
 
 def plain_pre(text: str) -> str:
