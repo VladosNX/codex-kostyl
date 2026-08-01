@@ -15,6 +15,13 @@ from .agents.codex import (
 )
 from .main_window import MainWindow
 from .diagnostics import configure_diagnostics
+from .integrations import (
+    AcpRegistrySource,
+    AgentIntegrationManager,
+    GitHubReleaseSource,
+    HttpClient,
+    IntegrationStore,
+)
 from .settings import AppSettings
 
 STYLE = """
@@ -224,8 +231,29 @@ def main() -> int:
             registry.add_profile(profile)
         except ValueError as exc:
             logger.warning("Ignored invalid agent profile %s: %s", profile.id, exc)
+    integration_store = IntegrationStore()
+    http = HttpClient(app)
+    github_source = GitHubReleaseSource(http, app)
+    registry_source = AcpRegistrySource(
+        http,
+        integration_store.root.parent / "cache" / "acp-registry",
+        app,
+    )
+    integration_manager = AgentIntegrationManager(
+        registry,
+        settings,
+        integration_store,
+        github_source,
+        registry_source,
+        app,
+    )
     service = AgentController(registry, settings)
-    window = MainWindow(service, settings, service.stop)
+    window = MainWindow(
+        service,
+        settings,
+        service.stop,
+        integration_manager,
+    )
     service.errorOccurred.connect(
         lambda message: logger.error("Agent/protocol error: %s", message)
     )
@@ -254,5 +282,7 @@ def main() -> int:
     if registry.profile(selected_profile) is None:
         selected_profile = "codex"
         settings.selected_agent_id = selected_profile
-    service.activate(selected_profile)
+    if not service.activate(selected_profile) and selected_profile != "codex":
+        settings.selected_agent_id = "codex"
+        service.activate("codex")
     return app.exec()

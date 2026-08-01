@@ -88,7 +88,11 @@ class AcpDriver(AgentDriver):
 
     @classmethod
     def create(cls, profile: AgentProfile) -> AcpDriver:
-        process = JsonLineProcess(profile.executable, list(profile.arguments))
+        process = JsonLineProcess(
+            profile.executable,
+            list(profile.arguments),
+            environment=dict(profile.environment),
+        )
         rpc = JsonRpcClient(process, jsonrpc_version="2.0")
         driver = cls(profile, rpc, process)
         process.started.connect(driver._initialize)
@@ -97,6 +101,13 @@ class AcpDriver(AgentDriver):
 
     @staticmethod
     def check_availability(profile: AgentProfile) -> AgentAvailability:
+        if profile.unavailable_reason:
+            return AgentAvailability(False, error=profile.unavailable_reason)
+        if not profile.executable.strip():
+            return AgentAvailability(
+                False,
+                error="Укажите путь к исполняемому файлу ACP-агента",
+            )
         raw = str(Path(profile.executable).expanduser())
         resolved = shutil.which(raw) or raw
         path = Path(resolved)

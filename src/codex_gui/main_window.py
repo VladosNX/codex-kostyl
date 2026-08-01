@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import mimetypes
-import re
-import shlex
 import shutil
 import sys
 import uuid
@@ -34,7 +32,6 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFrame,
-    QFormLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -70,6 +67,8 @@ from .agents.base import (
     PermissionOption,
     PermissionRequest,
 )
+from .agent_settings import AcpProfileDialog, AgentSettingsDialog
+from .integrations import AgentIntegrationManager
 from .models import PLAN_MODE_VALUE, AccessMode, Attachment, ModelInfo, ThreadSummary, weekly_limit_from_payload
 from .rendering import MarkdownRenderer, plain_pre
 from .settings import AppSettings
@@ -906,80 +905,20 @@ class ApiKeyDialog(QDialog):
         layout.addWidget(buttons)
 
 
-class AcpProfileDialog(QDialog):
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Добавить ACP-агента")
-        layout = QVBoxLayout(self)
-        form = QFormLayout()
-        self.name_input = QLineEdit()
-        self.name_input.setPlaceholderText("Например, Goose")
-        form.addRow("Название", self.name_input)
-        executable_row = QHBoxLayout()
-        self.executable_input = QLineEdit()
-        self.executable_input.setPlaceholderText("/путь/к/agent")
-        browse = QPushButton("Обзор…")
-        browse.clicked.connect(self._browse)
-        executable_row.addWidget(self.executable_input, 1)
-        executable_row.addWidget(browse)
-        form.addRow("Исполняемый файл", executable_row)
-        self.arguments_input = QLineEdit()
-        self.arguments_input.setPlaceholderText("Аргументы запуска, если нужны")
-        form.addRow("Аргументы", self.arguments_input)
-        layout.addLayout(form)
-        self.error_label = QLabel()
-        self.error_label.setObjectName("questionError")
-        self.error_label.setVisible(False)
-        layout.addWidget(self.error_label)
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self._accept_if_valid)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-    def _browse(self) -> None:
-        path, _filter = QFileDialog.getOpenFileName(self, "Исполняемый файл ACP-агента")
-        if path:
-            self.executable_input.setText(path)
-
-    def _accept_if_valid(self) -> None:
-        if not self.name_input.text().strip() or not self.executable_input.text().strip():
-            self.error_label.setText("Укажите название и исполняемый файл.")
-            self.error_label.setVisible(True)
-            return
-        try:
-            shlex.split(self.arguments_input.text())
-        except ValueError as exc:
-            self.error_label.setText(f"Некорректные аргументы: {exc}")
-            self.error_label.setVisible(True)
-            return
-        self.accept()
-
-    def profile(self, existing_ids: set[str]) -> AgentProfile:
-        name = self.name_input.text().strip()
-        base = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "acp-agent"
-        profile_id = base
-        suffix = 2
-        while profile_id in existing_ids:
-            profile_id = f"{base}-{suffix}"
-            suffix += 1
-        return AgentProfile(
-            profile_id,
-            "acp",
-            name,
-            self.executable_input.text().strip(),
-            tuple(shlex.split(self.arguments_input.text())),
-            "ACP v1 через локальный stdio",
-        )
-
-
 class MainWindow(QMainWindow):
-    def __init__(self, service: Any, settings: AppSettings, stop_server: Any) -> None:
+    def __init__(
+        self,
+        service: Any,
+        settings: AppSettings,
+        stop_server: Any,
+        integration_manager: AgentIntegrationManager | None = None,
+    ) -> None:
         super().__init__()
         self.service = service
         self.settings = settings
         self.stop_server = stop_server
+        self.integration_manager = integration_manager
+        self._agent_settings_dialog: AgentSettingsDialog | None = None
         self.models: list[ModelInfo] = []
         self.agent_config_options: tuple[AgentConfigOption, ...] = ()
         self.agent_manifest = AgentManifest()
@@ -1571,6 +1510,13 @@ class MainWindow(QMainWindow):
             self.agent_combo.addItem(descriptor.display_name, descriptor.id)
             index = self.agent_combo.count() - 1
             self.agent_combo.setItemData(index, descriptor.description, Qt.ItemDataRole.ToolTipRole)
+            availability_for = getattr(self.service, "availability_for", None)
+            if callable(availability_for):
+                availability = availability_for(descriptor.id)
+                model_item = self.agent_combo.model().item(index)
+                if model_item is not None and not availability.available:
+                    model_item.setEnabled(False)
+                    model_item.setToolTip(availability.error)
         index = self.agent_combo.findData(selected)
         self.agent_combo.setCurrentIndex(max(0, index))
         self.agent_combo.blockSignals(False)
@@ -1625,6 +1571,7 @@ class MainWindow(QMainWindow):
         if availability.available:
             detail = f" · {availability.version}" if availability.version else ""
             self.agent_combo.setToolTip(f"{self._agent_name()} доступен{detail}")
+            self.composer.setEnabled(not self._turn_active)
         else:
             self.agent_combo.setToolTip(availability.error)
             self.composer.setEnabled(False)
@@ -3394,12 +3341,35 @@ class MainWindow(QMainWindow):
         if callable(getattr(self.service, "add_profile", None)):
             menu.addAction("Добавить ACP-агента…", self._add_acp_profile)
             profile = getattr(self.service, "profile", None)
-            if isinstance(profile, AgentProfile) and not profile.built_in:
+            managed = (
+                self.integration_manager.integration_for_profile(profile.id)
+                if self.integration_manager is not None and isinstance(profile, AgentProfile)
+                else None
+            )
+            if isinstance(profile, AgentProfile) and not profile.built_in and managed is None:
                 menu.addAction(
                     f"Удалить профиль «{profile.display_name}»",
                     self._remove_current_profile,
                 )
+        if self.integration_manager is not None:
+            menu.addSeparator()
+            menu.addAction("Настройки агентов…", self._open_agent_settings)
         menu.exec(self.account_button.mapToGlobal(self.account_button.rect().bottomLeft()))
+
+    def _open_agent_settings(self) -> None:
+        if self.integration_manager is None:
+            return
+        if self._agent_settings_dialog is None:
+            self._agent_settings_dialog = AgentSettingsDialog(
+                self.service,
+                self.settings,
+                self.integration_manager,
+                self,
+            )
+        self._agent_settings_dialog.refresh()
+        self._agent_settings_dialog.show()
+        self._agent_settings_dialog.raise_()
+        self._agent_settings_dialog.activateWindow()
 
     def _authenticate_method(self, method: AuthMethod) -> None:
         secret = ""

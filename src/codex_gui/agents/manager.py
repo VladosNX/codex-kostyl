@@ -114,6 +114,16 @@ class AgentController(QObject):
         self.state = AgentState()
         self._generation = 0
         self._connections: list[tuple[Any, Any]] = []
+        registry.profilesChanged.connect(self._registry_profiles_changed)
+
+    def _registry_profiles_changed(self) -> None:
+        if self.active_profile_id and self.registry.profile(self.active_profile_id) is None:
+            self._release_active_driver()
+            self.active_profile_id = ""
+            self.active_agent_id = ""
+            self.profile = None
+        self.profilesChanged.emit(self.available_profiles)
+        self.agentsChanged.emit(self.available_agents)
 
     @property
     def current_thread_id(self) -> str:
@@ -193,6 +203,16 @@ class AgentController(QObject):
         self._publish_state()
         driver.start()
         return True
+
+    def availability_for(self, profile_id: str) -> AgentAvailability:
+        profile = self.registry.profile(profile_id)
+        if profile is None:
+            return AgentAvailability(False, error=f"Неизвестный агент: {profile_id}")
+        executable = profile.executable
+        getter = getattr(self.settings, "agent_get", None)
+        if callable(getter):
+            executable = str(getter(profile_id, "executable", executable)) or executable
+        return self.registry.probe(profile_id, executable)
 
     def _connect_driver(self, driver: Any) -> None:
         self._generation += 1
@@ -413,8 +433,6 @@ class AgentController(QObject):
         saver = getattr(self.settings, "save_agent_profile", None)
         if callable(saver):
             saver(profile)
-        self.profilesChanged.emit(self.available_profiles)
-        self.agentsChanged.emit(self.available_agents)
 
     def remove_profile(self, profile_id: str) -> None:
         profile = self.registry.profile(profile_id)
@@ -430,8 +448,6 @@ class AgentController(QObject):
         remover = getattr(self.settings, "remove_agent_profile", None)
         if callable(remover):
             remover(profile_id)
-        self.profilesChanged.emit(self.available_profiles)
-        self.agentsChanged.emit(self.available_agents)
 
     def set_project(self, path: str) -> None:
         self.current_project = path

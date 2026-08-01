@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/VladosNX/codex-kostyl/blob/main/src/codex_gui/assets/agent-package.schema.json",
+  "title": "Codex Kostyl agent integration package",
+  "type": "object",
+  "required": ["schemaVersion", "id", "name", "version", "description", "kind", "runtime"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+    "name": { "type": "string", "minLength": 1 },
+    "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$" },
+    "description": { "type": "string", "minLength": 1 },
+    "kind": { "enum": ["acp-command", "acp-adapter"] },
+    "homepage": { "type": "string", "format": "uri" },
+    "repository": { "type": "string", "format": "uri" },
+    "license": { "type": "string" },
+    "installHelp": {
+      "type": "object",
+      "properties": {
+        "url": { "type": "string", "format": "uri" },
+        "message": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "runtime": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {
+        "enum": ["any", "darwin-aarch64", "darwin-x86_64", "linux-aarch64", "linux-x86_64", "windows-aarch64", "windows-x86_64"]
+      },
+      "additionalProperties": { "$ref": "#/$defs/runtime" }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "runtime": {
+      "type": "object",
+      "required": ["command"],
+      "properties": {
+        "configurationRequired": { "type": "boolean" },
+        "command": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": ["system"],
+              "properties": { "system": { "type": "array", "items": { "type": "string" } } },
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "required": ["artifact"],
+              "properties": { "artifact": { "type": "string" } },
+              "additionalProperties": false
+            }
+          ]
+        },
+        "args": { "type": "array", "items": { "type": "string" } },
+        "env": { "type": "object", "additionalProperties": { "type": "string" } },
+        "artifact": {
+          "type": "object",
+          "required": ["asset", "sha256", "entrypoint"],
+          "properties": {
+            "asset": { "type": "string", "pattern": "^[^/\\\\]+\\.zip$" },
+            "sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+            "entrypoint": { "type": "string" }
+          },
+          "additionalProperties": false
+        },
+        "requirements": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "commands", "exportAs"],
+            "properties": {
+              "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+              "commands": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+              "exportAs": { "type": "string" },
+              "helpUrl": { "type": "string", "format": "uri" }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

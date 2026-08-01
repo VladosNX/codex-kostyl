@@ -62,6 +62,9 @@ class AppSettings:
     def agent_set(self, agent_id: str, key: str, value: object) -> None:
         self.set(f"agents/{agent_id}/{key}", value)
 
+    def remove_agent_settings(self, agent_id: str) -> None:
+        self._settings.remove(f"agents/{agent_id}")
+
     @property
     def agent_profiles(self) -> list[AgentProfile]:
         raw = self.get("agent_profiles_json", "[]")
@@ -82,6 +85,16 @@ class AppSettings:
             arguments = row.get("arguments", [])
             if not isinstance(arguments, list):
                 arguments = []
+            environment_rows = row.get("environment", [])
+            environment: list[tuple[str, str]] = []
+            if isinstance(environment_rows, list):
+                for pair in environment_rows:
+                    if (
+                        isinstance(pair, list)
+                        and len(pair) == 2
+                        and all(isinstance(value, str) for value in pair)
+                    ):
+                        environment.append((pair[0], pair[1]))
             profiles.append(
                 AgentProfile(
                     profile_id,
@@ -90,6 +103,8 @@ class AppSettings:
                     executable,
                     tuple(str(value) for value in arguments),
                     str(row.get("description") or ""),
+                    False,
+                    tuple(environment),
                 )
             )
         return profiles
@@ -105,6 +120,7 @@ class AppSettings:
                 "executable": item.executable,
                 "arguments": list(item.arguments),
                 "description": item.description,
+                "environment": [list(value) for value in item.environment],
             }
             for item in profiles.values()
             if not item.built_in
@@ -124,6 +140,7 @@ class AppSettings:
                         "executable": item.executable,
                         "arguments": list(item.arguments),
                         "description": item.description,
+                        "environment": [list(value) for value in item.environment],
                     }
                     for item in profiles
                 ],

@@ -51,6 +51,8 @@ execution, and sandbox enforcement.
 - ChatGPT and OpenAI API-key authentication through Codex.
 - Multiple local ACP v1 agent profiles with separate executables and launch
   arguments.
+- Installable ACP integrations from the official ACP Registry or the latest
+  stable Release of a public GitHub repository.
 - Dynamic ACP features, commands, authentication methods, models, modes, and
   settings; unsupported or temporarily disabled features remain visible with a
   reason.
@@ -109,6 +111,12 @@ The client uses stable ACP v1 over JSON-RPC 2.0 and local stdio. Conversation
 storage, authentication, and tool execution belong to the agent. The UI enables
 only advertised or observed features such as session listing, images, session
 modes, config options, slash commands, and usage reporting.
+
+The **Agents** settings page also provides the official ACP catalog and GitHub
+Release installation. Declarative packages only describe how to launch an
+already installed CLI. Protocol adapters are downloaded as verified ZIP assets
+and run as isolated ACP subprocesses. See the
+[integration package format](docs/agent-integrations.md) for authoring details.
 
 ## Other installation options
 
@@ -192,6 +200,7 @@ shellcheck scripts/*.sh packaging/codex-kostyl-launcher
 ```text
 src/codex_gui/
 ├── agents/          # Contracts, profiles, registry, controller, and ACP driver
+├── integrations/    # Catalog, GitHub packages, validation, and local storage
 ├── app.py           # Application startup and global Qt styling
 ├── main_window.py   # Main window, composer, timeline, and dialogs
 ├── models.py        # Application data models and access policies

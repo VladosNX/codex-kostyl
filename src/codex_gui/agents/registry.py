@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 
+from PySide6.QtCore import QObject, Signal
+
 from .base import AgentAvailability, AgentDescriptor, AgentDriver, AgentProfile
 
 DriverFactory = Callable[[AgentProfile], AgentDriver]
@@ -25,10 +27,13 @@ class AgentRegistration:
     probe: Callable[[str | None], AgentAvailability]
 
 
-class AgentRegistry:
+class AgentRegistry(QObject):
     """Registry of driver implementations and configured agent profiles."""
 
-    def __init__(self) -> None:
+    profilesChanged = Signal()
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
         self._drivers: dict[str, DriverRegistration] = {}
         self._profiles: dict[str, AgentProfile] = {}
         self._registrations: dict[str, AgentRegistration] = {}
@@ -44,6 +49,7 @@ class AgentRegistry:
         if profile.driver_kind not in self._drivers:
             raise ValueError(f"Unknown driver kind: {profile.driver_kind!r}")
         self._profiles[profile.id] = profile
+        self.profilesChanged.emit()
 
     def replace_profile(self, profile: AgentProfile) -> None:
         if profile.id not in self._profiles:
@@ -51,6 +57,7 @@ class AgentRegistry:
         if profile.driver_kind not in self._drivers:
             raise ValueError(f"Unknown driver kind: {profile.driver_kind!r}")
         self._profiles[profile.id] = profile
+        self.profilesChanged.emit()
 
     def remove_profile(self, profile_id: str) -> None:
         profile = self._profiles.get(profile_id)
@@ -59,6 +66,7 @@ class AgentRegistry:
         if profile.built_in:
             raise ValueError("Встроенный профиль нельзя удалить")
         self._profiles.pop(profile_id, None)
+        self.profilesChanged.emit()
 
     def register(self, registration: AgentRegistration) -> None:
         """Register the pre-profile API as a built-in profile."""

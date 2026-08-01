@@ -4,7 +4,7 @@ import json
 from collections.abc import Callable
 from typing import Any
 
-from PySide6.QtCore import QObject, QProcess, Signal
+from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Signal
 
 from . import __version__
 
@@ -71,11 +71,18 @@ class JsonLineProcess(QObject):
         program: str,
         arguments: list[str] | None = None,
         parent: QObject | None = None,
+        environment: dict[str, str] | None = None,
     ) -> None:
         super().__init__(parent)
         self.program = program
         self.arguments = list(arguments or [])
+        self.environment = dict(environment or {})
         self.process = QProcess(self)
+        if self.environment:
+            process_environment = QProcessEnvironment.systemEnvironment()
+            for key, value in self.environment.items():
+                process_environment.insert(key, value)
+            self.process.setProcessEnvironment(process_environment)
         self.process.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
         self.process.readyReadStandardOutput.connect(self._read_stdout)
         self.process.readyReadStandardError.connect(self._read_stderr)
@@ -147,7 +154,7 @@ class CodexProcess(JsonLineProcess):
     """Compatibility wrapper for the original public transport name."""
 
     def __init__(self, codex_path: str = "codex", parent: QObject | None = None) -> None:
-        super().__init__(codex_path, ["app-server", "--stdio"], parent)
+        super().__init__(codex_path, ["app-server", "--stdio"], parent=parent)
 
 
 class JsonRpcClient(QObject):

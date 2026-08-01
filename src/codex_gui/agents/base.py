@@ -104,6 +104,8 @@ class AgentProfile:
     arguments: tuple[str, ...] = ()
     description: str = ""
     built_in: bool = False
+    environment: tuple[tuple[str, str], ...] = ()
+    unavailable_reason: str = ""
 
 
 @dataclass(slots=True, frozen=True)
