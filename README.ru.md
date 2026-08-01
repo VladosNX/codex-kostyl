@@ -83,7 +83,22 @@ codex --version
 
 ## Быстрый старт
 
-На Linux клонируйте репозиторий и запустите установку для текущего пользователя:
+На Linux установите последний релиз для текущего пользователя одной командой:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/VladosNX/codex-kostyl/main/install.sh | bash
+```
+
+Установка конкретной версии:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/VladosNX/codex-kostyl/main/install.sh | bash -s -- --version 0.1.0
+```
+
+Удалённый bootstrap скачивает GitHub Release с нужным тегом во временную папку,
+а затем запускает локальный установщик из репозитория. Пока первый Release не
+опубликован, используется ветка `main`. Если хотите сначала проверить исходный
+код или установить локальный checkout, клонируйте репозиторий и выполните:
 
 ```bash
 git clone https://github.com/VladosNX/codex-kostyl.git
@@ -164,7 +179,13 @@ codex-kostyl
 
 ### Системная установка Linux
 
-Системная установка для всех пользователей:
+Установка последнего релиза для всех пользователей:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/VladosNX/codex-kostyl/main/install.sh | sudo bash -s -- --system
+```
+
+Из локального checkout:
 
 ```bash
 sudo ./scripts/install.sh --system
@@ -219,7 +240,7 @@ QT_QPA_PLATFORM=offscreen python -m pytest
 
 ```bash
 ruff check src tests
-shellcheck scripts/*.sh packaging/codex-kostyl-launcher
+shellcheck install.sh scripts/*.sh packaging/codex-kostyl-launcher
 ```
 
 ### Структура проекта

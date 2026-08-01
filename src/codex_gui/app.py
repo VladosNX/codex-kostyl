@@ -6,6 +6,7 @@ from importlib.resources import files
 from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+from . import __version__
 from .agents import AgentController, AgentRegistry
 from .agents.acp import acp_driver_registration
 from .agents.codex import (
@@ -215,9 +216,13 @@ def codex_preflight() -> tuple[str | None, str | None]:
 
 
 def main() -> int:
+    if any(argument in {"--version", "-V"} for argument in sys.argv[1:]):
+        print(f"Codex Kostyl {__version__}")
+        return 0
     app = QApplication(sys.argv)
     app.setApplicationName("Codex Kostyl")
     app.setApplicationDisplayName("Codex Kostyl")
+    app.setApplicationVersion(__version__)
     app.setDesktopFileName("codex-kostyl")
     app.setOrganizationName("CodexKostyl")
     app.setWindowIcon(QIcon(str(files("codex_gui").joinpath("assets/codex-kostyl.svg"))))

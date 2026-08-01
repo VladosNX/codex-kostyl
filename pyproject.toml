@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "codex-kostyl"
-version = "0.1.0"
+dynamic = ["version"]
 description = "A cross-platform desktop GUI for local AI coding agents"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -27,6 +27,9 @@ codex-kostyl = "codex_gui.app:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/codex_gui"]
+
+[tool.hatch.version]
+path = "src/codex_gui/_version.py"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

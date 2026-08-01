@@ -85,7 +85,22 @@ codex --version
 
 ## Quick start
 
-On Linux, clone the repository and run the per-user installer:
+On Linux, install the latest release for the current user with one command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/VladosNX/codex-kostyl/main/install.sh | bash
+```
+
+To install a particular version instead:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/VladosNX/codex-kostyl/main/install.sh | bash -s -- --version 0.1.0
+```
+
+The remote bootstrap downloads a tagged GitHub Release into a temporary
+directory and then runs the repository's local installer. Until the first
+Release is published, it falls back to the `main` branch. If you prefer to
+inspect the source or install a local checkout, clone the repository and run:
 
 ```bash
 git clone https://github.com/VladosNX/codex-kostyl.git
@@ -163,7 +178,13 @@ configured separately for each agent profile.
 
 ### System-wide Linux installation
 
-Install the application system-wide for all users:
+Install the latest release system-wide for all users:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/VladosNX/codex-kostyl/main/install.sh | sudo bash -s -- --system
+```
+
+From a local checkout, use:
 
 ```bash
 sudo ./scripts/install.sh --system
@@ -218,7 +239,7 @@ Useful additional checks:
 
 ```bash
 ruff check src tests
-shellcheck scripts/*.sh packaging/codex-kostyl-launcher
+shellcheck install.sh scripts/*.sh packaging/codex-kostyl-launcher
 ```
 
 ### Project structure
