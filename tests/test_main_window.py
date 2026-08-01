@@ -4,10 +4,10 @@ from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QObject, Qt, Signal
 from PySide6.QtGui import QTextCursor
-from PySide6.QtWidgets import QLabel, QMessageBox, QWidget
+from PySide6.QtWidgets import QLabel, QMessageBox, QPushButton, QWidget
 
 from codex_gui.main_window import MainWindow, QueuedCommand
-from codex_gui.models import PLAN_MODE_VALUE, AccessMode, Attachment, ModelInfo
+from codex_gui.models import PLAN_MODE_VALUE, AccessMode, Attachment, ModelInfo, ThreadSummary
 
 
 class FakeService(QObject):
@@ -206,6 +206,21 @@ def test_completed_turn_leaves_duration_in_timeline(qtbot) -> None:
     assert labels[0].text().startswith("Готово за ")
 
 
+def test_thinking_label_tracks_current_agent_activity(qtbot) -> None:
+    window, _service = make_window(qtbot)
+    window._turn_state("inProgress")
+    assert window._thinking_indicator is not None
+
+    window._reasoning_delta("reasoning", "Проверяю")
+    assert "ИИ анализирует" in window._thinking_indicator.label.text()
+
+    window._command_delta("command", "pytest")
+    assert "ИИ выполняет команду" in window._thinking_indicator.label.text()
+
+    window._agent_delta("answer", "Готово")
+    assert "ИИ пишет ответ" in window._thinking_indicator.label.text()
+
+
 def test_permission_prompt_shows_scope_and_preserves_response_context(qtbot) -> None:
     window, service = make_window(qtbot)
     params = {
@@ -218,7 +233,8 @@ def test_permission_prompt_shows_scope_and_preserves_response_context(qtbot) -> 
         "item/permissions/requestApproval",
         params,
     )
-    assert "enabled" in window.approval_card.detail.text()
+    assert "Доступ к сети: разрешён" in window.approval_card.detail.text()
+    assert "Нужен доступ к API" in window.approval_card.detail.text()
     window._answer_inline_approval("acceptForSession")
 
     assert service.approvals == [
@@ -300,6 +316,110 @@ def test_project_selector_is_in_prompt_bubble_not_sidebar(qtbot) -> None:
     composer_area_layout = composer_panel.parentWidget().layout()
     assert composer_area_layout.indexOf(window.project_bubble) < composer_area_layout.indexOf(window.slash_panel)
     assert composer_area_layout.indexOf(window.slash_panel) < composer_area_layout.indexOf(composer_panel)
+
+
+def test_request_settings_use_nested_model_and_effort_menus(qtbot) -> None:
+    window, _service = make_window(qtbot)
+    window._set_models(
+        [
+            ModelInfo("model-a", "Model A", ["low"], "low"),
+            ModelInfo("model-b", "Model B", ["medium", "high"], "medium"),
+        ]
+    )
+
+    assert window.access_combo.parentWidget().objectName() == "composerPanel"
+    assert window.context_usage_widget.parentWidget().objectName() == "composerPanel"
+    assert window.weekly_limit.parentWidget().objectName() == "composerPanel"
+
+    menu = window._build_request_settings_menu()
+    model_menu = menu.actions()[0].menu()
+    effort_menu = menu.actions()[1].menu()
+
+    assert model_menu is not None and model_menu.title() == "Model A"
+    assert effort_menu is not None and effort_menu.title() == "Low effort"
+    model_menu.actions()[1].trigger()
+    assert window.model_combo.currentData() == "model-b"
+
+    menu = window._build_request_settings_menu()
+    effort_menu = menu.actions()[1].menu()
+    assert effort_menu is not None and effort_menu.title() == "Medium effort"
+    effort_menu.actions()[1].trigger()
+
+    assert window.effort_combo.currentData() == "high"
+
+
+def test_access_mode_has_semantic_style_and_active_turn_notice(qtbot) -> None:
+    window, _service = make_window(qtbot)
+    window._turn_state("inProgress")
+    window.access_combo.setCurrentIndex(window.access_combo.findData(PLAN_MODE_VALUE))
+
+    assert window.access_combo.property("mode") == "plan"
+    assert window.access_combo.property("nextTurn") is True
+    assert "следующему сообщению" in window.notice_label.text()
+    assert window.notice_banner.isHidden() is False
+
+
+def test_thread_search_filters_title_folder_and_path(qtbot) -> None:
+    window, _service = make_window(qtbot)
+    window._set_threads(
+        [
+            ThreadSummary("one", "Исправить интерфейс", "/repo/frontend"),
+            ThreadSummary("two", "Обновить документацию", "/repo/docs"),
+        ]
+    )
+
+    window.thread_search.setText("docs")
+
+    assert window.thread_list.item(0).isHidden() is True
+    assert window.thread_list.item(1).isHidden() is False
+
+
+def test_sidebar_can_be_collapsed_with_header_control(qtbot) -> None:
+    window, _service = make_window(qtbot)
+    window.show()
+    qtbot.wait(10)
+
+    window.sidebar_toggle.click()
+    assert window.sidebar_panel.isHidden() is True
+
+    window.sidebar_toggle.click()
+    assert window.sidebar_panel.isHidden() is False
+
+
+def test_sidebar_auto_hides_on_narrow_window_but_respects_manual_choice(qtbot) -> None:
+    window, _service = make_window(qtbot)
+    window.show()
+    window.resize(1200, 700)
+    qtbot.wait(10)
+    assert window.sidebar_panel.isHidden() is False
+
+    window.resize(900, 700)
+    qtbot.wait(10)
+    assert window.sidebar_panel.isHidden() is True
+    assert window._sidebar_auto_hidden is True
+
+    window.resize(1200, 700)
+    qtbot.wait(10)
+    assert window.sidebar_panel.isHidden() is False
+
+    window.sidebar_toggle.click()
+    window.resize(900, 700)
+    window.resize(1200, 700)
+    qtbot.wait(10)
+    assert window.sidebar_panel.isHidden() is True
+
+
+def test_empty_state_starter_moves_prompt_to_composer(qtbot) -> None:
+    window, _service = make_window(qtbot)
+    buttons = [
+        button
+        for button in window.timeline.findChildren(QPushButton)
+        if button.objectName() == "starterButton"
+    ]
+
+    assert len(buttons) == 3
+    buttons[0].click()
+    assert window.composer.toPlainText().startswith("Изучи проект")
 
 
 def test_slash_panel_appears_filters_and_shows_unavailable_reason(qtbot) -> None:
@@ -500,7 +620,9 @@ def test_mixed_message_and_command_queue_is_strict_fifo(qtbot) -> None:
         window._send()
 
     assert isinstance(window._message_queue[1], QueuedCommand)
-    assert "/compact" in window.queue_items_layout.itemAt(1).widget().text()
+    command_row = window.queue_items_layout.itemAt(1).widget()
+    command_text = command_row.findChild(QLabel, "queueItemText")
+    assert command_text is not None and "/compact" in command_text.text()
     window._turn_state("completed")
     qtbot.waitUntil(lambda: service.actions == [("message", "первое")])
     window._turn_state("inProgress")
@@ -515,6 +637,73 @@ def test_mixed_message_and_command_queue_is_strict_fifo(qtbot) -> None:
         ("compact", ""),
         ("message", "второе"),
     ]
+
+
+def test_queued_message_has_explicit_edit_and_remove_actions(qtbot) -> None:
+    window, _service = make_window(qtbot)
+    window._turn_state("inProgress")
+    window.composer.setPlainText("Исходный текст")
+    window._send()
+
+    row = window.queue_items_layout.itemAt(0).widget()
+    actions = row.findChildren(QWidget, "queueItemAction")
+    qtbot.mouseClick(row, Qt.MouseButton.LeftButton)
+
+    assert len(actions) == 2
+    assert len(window._message_queue) == 1
+    assert window._update_queued_message(0, "Отредактированный текст") is True
+    assert len(window._message_queue) == 1
+    assert window._message_queue[0].text == "Отредактированный текст"
+
+
+def test_queue_edit_uses_composer_and_restores_existing_draft(qtbot) -> None:
+    window, _service = make_window(qtbot)
+    window._turn_state("inProgress")
+    window.composer.setPlainText("Сообщение из очереди")
+    window._send()
+    window.composer.setPlainText("Новый черновик пользователя")
+
+    window._edit_queued_message(0)
+
+    assert window.composer.toPlainText() == "Сообщение из очереди"
+    assert window.queue_edit_banner.isHidden() is False
+    assert window.send_button.accessibleName() == "Сохранить изменения сообщения в очереди"
+    assert window.attach_button.isEnabled() is False
+
+    window.composer.setPlainText("Изменённое сообщение")
+    window._send()
+
+    assert window._message_queue[0].text == "Изменённое сообщение"
+    assert window.composer.toPlainText() == "Новый черновик пользователя"
+    assert window.queue_edit_banner.isHidden() is True
+    assert window.attach_button.isEnabled() is True
+
+
+def test_queue_waits_while_message_is_being_edited(qtbot) -> None:
+    window, service = make_window(qtbot)
+    window._turn_state("inProgress")
+    window.composer.setPlainText("Не отправляй до завершения редактирования")
+    window._send()
+    window._edit_queued_message(0)
+
+    window._turn_state("completed")
+    qtbot.wait(10)
+    assert service.sent == []
+
+    window._cancel_queue_edit()
+    qtbot.waitUntil(lambda: len(service.sent) == 1)
+    assert service.sent[0][0] == "Не отправляй до завершения редактирования"
+
+
+def test_queue_does_not_show_redundant_added_notice(qtbot) -> None:
+    window, _service = make_window(qtbot)
+    window._turn_state("inProgress")
+    window.composer.setPlainText("Следующее сообщение")
+
+    window._send()
+
+    assert window.queue_panel.isHidden() is False
+    assert window.notice_banner.isHidden() is True
 
 
 def test_queue_stops_after_command_error_and_keeps_remaining_items(qtbot) -> None:

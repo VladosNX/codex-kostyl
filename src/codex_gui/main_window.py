@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-import json
 import mimetypes
 import uuid
 from dataclasses import dataclass
+from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QDateTime, QElapsedTimer, QEvent, QObject, QProcess, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QDateTime, QElapsedTimer, QEvent, QObject, QPoint, QProcess, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QColor,
     QCloseEvent,
@@ -18,7 +18,9 @@ from PySide6.QtGui import (
     QImageReader,
     QKeyEvent,
     QPixmap,
+    QKeySequence,
     QResizeEvent,
+    QShortcut,
     QTextCursor,
 )
 from PySide6.QtWidgets import (
@@ -60,6 +62,40 @@ MAX_RENDERED_MESSAGE_CHARS = 160_000
 MAX_ACTIVITY_CONTENT_CHARS = 120_000
 MAX_HISTORY_TURNS = 40
 MAX_HISTORY_ITEMS = 300
+SIDEBAR_AUTO_HIDE_WIDTH = 980
+SIDEBAR_AUTO_SHOW_WIDTH = 1100
+THREAD_SEARCH_ROLE = int(Qt.ItemDataRole.UserRole) + 2
+THREAD_TITLE_ROLE = int(Qt.ItemDataRole.UserRole) + 3
+
+
+def asset_icon(name: str) -> QIcon:
+    """Return an application-owned icon for consistent cross-desktop rendering."""
+    return QIcon(str(files("codex_gui").joinpath("assets", name)))
+
+
+def localized_status(status: object) -> str:
+    value = str(status or "")
+    return {
+        "starting": "запускается",
+        "inProgress": "выполняется",
+        "completed": "завершено",
+        "failed": "ошибка",
+        "interrupted": "остановлено",
+        "cancelled": "отменено",
+        "canceled": "отменено",
+    }.get(value, value or "неизвестно")
+
+
+def effort_title(effort: object) -> str:
+    value = str(effort or "").strip()
+    return {
+        "none": "No effort",
+        "minimal": "Minimal effort",
+        "low": "Low effort",
+        "medium": "Medium effort",
+        "high": "High effort",
+        "xhigh": "Extra high effort",
+    }.get(value, f"{value} effort" if value else "Effort")
 
 
 @dataclass(slots=True)
@@ -371,16 +407,18 @@ class MessageCard(QFrame):
         actions.addStretch(1)
         self.copy_button = QToolButton()
         self.copy_button.setObjectName("messageActionButton")
-        self.copy_button.setText("⧉")
+        self.copy_button.setIcon(asset_icon("copy.svg"))
         self.copy_button.setToolTip("Скопировать полный текст сообщения")
+        self.copy_button.setAccessibleName("Скопировать сообщение")
         self.copy_button.setFixedSize(27, 25)
         actions.addWidget(self.copy_button)
         self.edit_button: QToolButton | None = None
         if role == "user":
             self.edit_button = QToolButton()
             self.edit_button.setObjectName("messageActionButton")
-            self.edit_button.setText("✎")
+            self.edit_button.setIcon(asset_icon("edit.svg"))
             self.edit_button.setToolTip("Перенести текст в поле ввода для редактирования")
+            self.edit_button.setAccessibleName("Редактировать сообщение")
             self.edit_button.setFixedSize(27, 25)
             actions.addWidget(self.edit_button)
         layout.addLayout(actions)
@@ -436,7 +474,8 @@ class ThinkingIndicator(QFrame):
         self.setObjectName("thinkingIndicator")
         layout = QHBoxLayout(self)
         layout.setContentsMargins(5, 3, 5, 3)
-        self.label = QLabel("✦  ИИ думает   ")
+        self._activity = "ИИ думает"
+        self.label = QLabel()
         self.label.setObjectName("thinkingLabel")
         layout.addWidget(self.label)
         layout.addStretch(1)
@@ -444,10 +483,12 @@ class ThinkingIndicator(QFrame):
         self._timer = QTimer(self)
         self._timer.setInterval(420)
         self._timer.timeout.connect(self._animate)
+        self._render_frame()
 
     def start(self) -> None:
         self._frame = 0
-        self.label.setText("✦  ИИ думает   ")
+        self._activity = "ИИ думает"
+        self._render_frame()
         self._timer.start()
 
     def stop(self) -> None:
@@ -455,8 +496,16 @@ class ThinkingIndicator(QFrame):
 
     def _animate(self) -> None:
         self._frame = (self._frame + 1) % 4
+        self._render_frame()
+
+    def set_activity(self, activity: str) -> None:
+        self._activity = activity.strip() or "ИИ думает"
+        self._frame = 0
+        self._render_frame()
+
+    def _render_frame(self) -> None:
         dots = "." * self._frame
-        self.label.setText(f"✦  ИИ думает{dots:<3}")
+        self.label.setText(f"✦  {self._activity}{dots:<3}")
 
 
 class ActivityCard(QFrame):
@@ -578,7 +627,7 @@ class ExecutionPlanCard(QFrame):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 11, 14, 12)
         layout.setSpacing(7)
-        title = QLabel("UPDATED PLAN")
+        title = QLabel("ПЛАН ВЫПОЛНЕНИЯ")
         title.setObjectName("executionPlanTitle")
         layout.addWidget(title)
         self.explanation = QLabel()
@@ -777,15 +826,22 @@ class InlineApprovalCard(QFrame):
         layout.addWidget(self.detail)
 
         actions = QHBoxLayout()
+        self.stop_button = QPushButton("Остановить выполнение")
+        self.stop_button.setObjectName("approvalDangerButton")
+        self.stop_button.setToolTip("Остановить текущий ход и отклонить запрос")
+        self.stop_button.clicked.connect(
+            lambda _checked=False: self.decisionSelected.emit("cancel")
+        )
+        actions.addWidget(self.stop_button)
         actions.addStretch(1)
         for text, decision, object_name in (
-            ("Отклонить", "decline", "approvalSecondaryButton"),
-            ("Отменить ход", "cancel", "approvalDangerButton"),
-            ("На сессию", "acceptForSession", "approvalSecondaryButton"),
-            ("Разрешить", "accept", "approvalPrimaryButton"),
+            ("Запретить", "decline", "approvalSecondaryButton"),
+            ("Разрешить до закрытия чата", "acceptForSession", "approvalSecondaryButton"),
+            ("Разрешить один раз", "accept", "approvalPrimaryButton"),
         ):
             button = QPushButton(text)
             button.setObjectName(object_name)
+            button.setAccessibleName(text)
             button.clicked.connect(
                 lambda _checked=False, value=decision: self.decisionSelected.emit(value)
             )
@@ -829,6 +885,9 @@ class MainWindow(QMainWindow):
         self._user_input_queue: list[tuple[object, dict[str, Any]]] = []
         self._current_user_input: tuple[object, dict[str, Any]] | None = None
         self._message_queue: list[QueuedMessage | QueuedCommand] = []
+        self._editing_queued_message: QueuedMessage | None = None
+        self._queue_edit_draft_text = ""
+        self._queue_edit_draft_attachments: list[Attachment] = []
         self._queue_paused = False
         self._queue_action_pending = False
         self._turn_active = False
@@ -840,6 +899,8 @@ class MainWindow(QMainWindow):
         self._slash_help_visible = False
         self._auto_follow = True
         self._danger_acknowledged = False
+        self._sidebar_user_hidden = False
+        self._sidebar_auto_hidden = False
         self._closing = False
         self._build_ui()
         self._build_notifications()
@@ -849,16 +910,19 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         self.setWindowTitle("Codex")
-        self.setMinimumSize(920, 640)
+        self.setMinimumSize(760, 640)
         self.resize(1280, 820)
-        splitter = QSplitter()
-        splitter.setObjectName("mainSplitter")
-        splitter.setHandleWidth(1)
-        splitter.setChildrenCollapsible(False)
-        splitter.addWidget(self._build_sidebar())
-        splitter.addWidget(self._build_chat())
-        splitter.setSizes([272, 1008])
-        self.setCentralWidget(splitter)
+        self.main_splitter = QSplitter()
+        self.main_splitter.setObjectName("mainSplitter")
+        self.main_splitter.setHandleWidth(1)
+        self.main_splitter.setChildrenCollapsible(False)
+        self.sidebar_panel = self._build_sidebar()
+        self.main_splitter.addWidget(self.sidebar_panel)
+        self.main_splitter.addWidget(self._build_chat())
+        self.main_splitter.setSizes([272, 1008])
+        self.setCentralWidget(self.main_splitter)
+        self.sidebar_shortcut = QShortcut(QKeySequence("Ctrl+B"), self)
+        self.sidebar_shortcut.activated.connect(self._toggle_sidebar)
         self.statusBar().showMessage("Запуск Codex app-server…")
 
     def _build_notifications(self) -> None:
@@ -892,6 +956,30 @@ class MainWindow(QMainWindow):
             )
         QApplication.alert(self, 4000)
 
+    def _toggle_sidebar(self) -> None:
+        visible = not self.sidebar_panel.isHidden()
+        self._sidebar_user_hidden = visible
+        self._sidebar_auto_hidden = False
+        self._set_sidebar_visible(not visible)
+        self.settings.set("sidebar_hidden", self._sidebar_user_hidden)
+
+    def _set_sidebar_visible(self, visible: bool) -> None:
+        self.sidebar_panel.setVisible(visible)
+        if visible:
+            self.main_splitter.setSizes([272, max(488, self.width() - 272)])
+        self.sidebar_toggle.setToolTip(
+            ("Скрыть" if visible else "Показать")
+            + " боковую панель · Ctrl+B"
+        )
+
+    def _show_notice(self, message: str, level: str = "info", timeout: int = 4500) -> None:
+        self.notice_label.setText(message)
+        self.notice_banner.setProperty("level", level)
+        self.notice_banner.style().unpolish(self.notice_banner)
+        self.notice_banner.style().polish(self.notice_banner)
+        self.notice_banner.setVisible(True)
+        self._notice_timer.start(timeout)
+
     def _build_sidebar(self) -> QWidget:
         panel = QWidget()
         panel.setObjectName("sidebar")
@@ -910,9 +998,16 @@ class MainWindow(QMainWindow):
         brand_row.addStretch(1)
         layout.addLayout(brand_row)
 
-        self.new_chat_button = QPushButton("＋   Новый чат")
+        self.new_chat_button = QPushButton("Новый чат")
         self.new_chat_button.setObjectName("newChatButton")
+        self.new_chat_button.setIcon(asset_icon("new-chat.svg"))
+        self.new_chat_button.setAccessibleName("Создать новый чат")
         self.new_chat_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.thread_search = QLineEdit()
+        self.thread_search.setObjectName("threadSearch")
+        self.thread_search.setPlaceholderText("Поиск по чатам…")
+        self.thread_search.setClearButtonEnabled(True)
+        self.thread_search.setAccessibleName("Поиск по истории чатов")
         self.thread_list = QListWidget()
         self.thread_list.setObjectName("threadList")
         self.thread_list.setSpacing(3)
@@ -921,11 +1016,13 @@ class MainWindow(QMainWindow):
         section = QLabel("НЕДАВНИЕ ЧАТЫ")
         section.setObjectName("sectionLabel")
         layout.addWidget(section)
+        layout.addWidget(self.thread_search)
         layout.addWidget(self.thread_list, 1)
         self.account_button = QPushButton("  ◉   Аккаунт")
         self.account_button.setObjectName("accountButton")
         layout.addWidget(self.account_button)
         self.new_chat_button.clicked.connect(self._new_chat)
+        self.thread_search.textChanged.connect(self._filter_threads)
         self.thread_list.itemClicked.connect(self._thread_activated)
         self.account_button.clicked.connect(self._account_menu)
         return panel
@@ -940,7 +1037,15 @@ class MainWindow(QMainWindow):
         topbar = QWidget()
         topbar.setObjectName("topbar")
         topbar_layout = QHBoxLayout(topbar)
-        topbar_layout.setContentsMargins(28, 13, 22, 13)
+        topbar_layout.setContentsMargins(16, 13, 22, 13)
+        self.sidebar_toggle = QToolButton()
+        self.sidebar_toggle.setObjectName("sidebarToggle")
+        self.sidebar_toggle.setIcon(asset_icon("sidebar.svg"))
+        self.sidebar_toggle.setToolTip("Скрыть или показать боковую панель · Ctrl+B")
+        self.sidebar_toggle.setAccessibleName("Переключить боковую панель")
+        self.sidebar_toggle.setFixedSize(32, 32)
+        self.sidebar_toggle.clicked.connect(self._toggle_sidebar)
+        topbar_layout.addWidget(self.sidebar_toggle)
         titles = QVBoxLayout()
         titles.setSpacing(1)
         self.chat_title = QLabel("Новый чат")
@@ -956,16 +1061,21 @@ class MainWindow(QMainWindow):
         topbar_layout.addWidget(self.header_status)
         layout.addWidget(topbar)
 
-        self.model_combo = QComboBox()
+        self.model_combo = QComboBox(panel)
         self.model_combo.setObjectName("optionCombo")
-        self.model_combo.setMinimumWidth(180)
-        self.effort_combo = QComboBox()
+        self.model_combo.setMinimumWidth(160)
+        self.model_combo.setAccessibleName("Модель Codex")
+        self.model_combo.setVisible(False)
+        self.effort_combo = QComboBox(panel)
         self.effort_combo.setObjectName("optionCombo")
+        self.effort_combo.setAccessibleName("Глубина рассуждений")
+        self.effort_combo.setVisible(False)
         self.access_combo = QComboBox()
-        self.access_combo.setObjectName("optionCombo")
+        self.access_combo.setObjectName("accessCombo")
+        self.access_combo.setAccessibleName("Режим доступа")
         for mode in AccessMode:
             self.access_combo.addItem(mode.title, mode.value)
-        self.access_combo.addItem("Plan Mode", PLAN_MODE_VALUE)
+        self.access_combo.addItem("Режим планирования", PLAN_MODE_VALUE)
 
         self.scroll = QScrollArea()
         self.scroll.setObjectName("conversationScroll")
@@ -1009,7 +1119,7 @@ class MainWindow(QMainWindow):
         composer_shell = QWidget()
         composer_shell.setObjectName("composerShell")
         shell_layout = QVBoxLayout(composer_shell)
-        shell_layout.setContentsMargins(48, 10, 48, 22)
+        shell_layout.setContentsMargins(28, 10, 28, 18)
         shell_layout.setAlignment(Qt.AlignmentFlag.AlignHCenter)
 
         composer_area = QWidget()
@@ -1035,7 +1145,7 @@ class MainWindow(QMainWindow):
         project_layout = QHBoxLayout(self.project_bubble)
         project_layout.setContentsMargins(8, 2, 3, 2)
         project_layout.setSpacing(3)
-        project_icon = QLabel("⌂")
+        project_icon = QLabel("Проект")
         project_icon.setObjectName("projectBubbleIcon")
         project_layout.addWidget(project_icon)
         self.project_combo = QComboBox()
@@ -1047,10 +1157,12 @@ class MainWindow(QMainWindow):
         self.project_combo.setMinimumContentsLength(12)
         self.project_combo.setMaximumWidth(300)
         project_layout.addWidget(self.project_combo)
-        add_project = QToolButton()
+        self.add_project_button = QToolButton()
+        add_project = self.add_project_button
         add_project.setObjectName("projectBubbleButton")
-        add_project.setText("＋")
+        add_project.setIcon(asset_icon("folder-plus.svg"))
         add_project.setToolTip("Добавить рабочую папку")
+        add_project.setAccessibleName("Добавить рабочую папку")
         add_project.setFixedSize(25, 25)
         project_layout.addWidget(add_project)
         composer_area_layout.addWidget(
@@ -1062,6 +1174,47 @@ class MainWindow(QMainWindow):
         self.slash_panel = SlashCommandPanel()
         composer_area_layout.addWidget(self.slash_panel)
 
+        self.notice_banner = QFrame()
+        self.notice_banner.setObjectName("noticeBanner")
+        notice_layout = QHBoxLayout(self.notice_banner)
+        notice_layout.setContentsMargins(11, 7, 11, 7)
+        self.notice_label = QLabel()
+        self.notice_label.setObjectName("noticeLabel")
+        self.notice_label.setWordWrap(True)
+        notice_layout.addWidget(self.notice_label)
+        self.notice_banner.setVisible(False)
+        self._notice_timer = QTimer(self)
+        self._notice_timer.setSingleShot(True)
+        self._notice_timer.timeout.connect(lambda: self.notice_banner.setVisible(False))
+        composer_area_layout.addWidget(self.notice_banner)
+
+        self.queue_edit_banner = QFrame()
+        self.queue_edit_banner.setObjectName("queueEditBanner")
+        queue_edit_layout = QHBoxLayout(self.queue_edit_banner)
+        queue_edit_layout.setContentsMargins(11, 8, 8, 8)
+        queue_edit_layout.setSpacing(9)
+        queue_edit_icon = QLabel("✎")
+        queue_edit_icon.setObjectName("queueEditIcon")
+        queue_edit_layout.addWidget(queue_edit_icon)
+        queue_edit_text = QVBoxLayout()
+        queue_edit_text.setSpacing(1)
+        queue_edit_title = QLabel("РЕДАКТИРОВАНИЕ СООБЩЕНИЯ ИЗ ОЧЕРЕДИ")
+        queue_edit_title.setObjectName("queueEditTitle")
+        self.queue_edit_detail = QLabel()
+        self.queue_edit_detail.setObjectName("queueEditDetail")
+        queue_edit_text.addWidget(queue_edit_title)
+        queue_edit_text.addWidget(self.queue_edit_detail)
+        queue_edit_layout.addLayout(queue_edit_text, 1)
+        self.queue_edit_cancel_button = QPushButton("Отменить")
+        self.queue_edit_cancel_button.setObjectName("queueEditCancel")
+        self.queue_edit_cancel_button.setToolTip(
+            "Отменить редактирование и вернуть предыдущий черновик"
+        )
+        self.queue_edit_cancel_button.clicked.connect(self._cancel_queue_edit)
+        queue_edit_layout.addWidget(self.queue_edit_cancel_button)
+        self.queue_edit_banner.setVisible(False)
+        composer_panel_layout.addWidget(self.queue_edit_banner)
+
         self.attachment_row = QHBoxLayout()
         self.attachment_row.addStretch(1)
         composer_panel_layout.addLayout(self.attachment_row)
@@ -1071,13 +1224,14 @@ class MainWindow(QMainWindow):
 
         controls_row = QHBoxLayout()
         controls_row.setSpacing(4)
-        attach = QPushButton("＋")
+        self.attach_button = QPushButton()
+        attach = self.attach_button
         attach.setObjectName("attachButton")
+        attach.setIcon(asset_icon("attach.svg"))
         attach.setToolTip("Прикрепить изображение или файл")
+        attach.setAccessibleName("Прикрепить файл")
         attach.setFixedSize(32, 32)
         controls_row.addWidget(attach)
-        controls_row.addWidget(self.model_combo)
-        controls_row.addWidget(self.effort_combo)
         controls_row.addWidget(self.access_combo)
         controls_row.addStretch(1)
 
@@ -1117,14 +1271,25 @@ class MainWindow(QMainWindow):
         limit_layout.addWidget(self.weekly_limit_bar)
         self.weekly_limit.setToolTip("Недельный лимит доступен при входе через ChatGPT")
         controls_row.addWidget(self.weekly_limit)
+        self.settings_button = QToolButton()
+        self.settings_button.setObjectName("settingsButton")
+        self.settings_button.setIcon(asset_icon("settings.svg"))
+        self.settings_button.setToolTip("Выбрать модель и усилие рассуждений")
+        self.settings_button.setAccessibleName("Настройки запроса")
+        self.settings_button.setFixedSize(32, 32)
+        controls_row.addWidget(self.settings_button)
 
-        self.send_button = QPushButton("↑")
+        self.send_button = QPushButton()
         self.send_button.setObjectName("sendButton")
+        self.send_button.setIcon(asset_icon("send.svg"))
         self.send_button.setToolTip("Отправить · Ctrl+Enter")
+        self.send_button.setAccessibleName("Отправить сообщение")
         self.send_button.setFixedSize(34, 34)
-        self.stop_button = QPushButton("■")
+        self.stop_button = QPushButton()
         self.stop_button.setObjectName("stopButton")
+        self.stop_button.setIcon(asset_icon("stop.svg"))
         self.stop_button.setToolTip("Остановить выполнение")
+        self.stop_button.setAccessibleName("Остановить выполнение")
         self.stop_button.setFixedSize(34, 34)
         self.stop_button.setVisible(False)
         controls_row.addWidget(self.send_button)
@@ -1198,6 +1363,7 @@ class MainWindow(QMainWindow):
         self.model_combo.currentIndexChanged.connect(self._model_changed)
         self.effort_combo.currentIndexChanged.connect(self._effort_changed)
         self.access_combo.currentIndexChanged.connect(self._access_changed)
+        self.settings_button.clicked.connect(self._show_request_settings_menu)
         return panel
 
     def _connect_service(self) -> None:
@@ -1238,12 +1404,18 @@ class MainWindow(QMainWindow):
             self.access_combo.setCurrentIndex(mode_index)
             self.access_combo.blockSignals(False)
         if saved_selection == PLAN_MODE_VALUE:
-            self.access_combo.setToolTip("Plan Mode: анализ и планирование без изменения файлов")
+            self.access_combo.setToolTip("Режим планирования: анализ без изменения файлов")
+        self._refresh_access_style()
         geometry, state = self.settings.restore_geometry()
         if not geometry.isEmpty():
             self.restoreGeometry(geometry)
         if not state.isEmpty():
             self.restoreState(state)
+        self._sidebar_user_hidden = self.settings.get(
+            "sidebar_hidden", "false"
+        ).lower() in {"1", "true", "yes"}
+        if self._sidebar_user_hidden:
+            self._set_sidebar_visible(False)
 
     def _add_project(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Выберите рабочую папку")
@@ -1282,15 +1454,34 @@ class MainWindow(QMainWindow):
         self.thread_list.clear()
         for thread in threads:
             folder = Path(thread.cwd).name if thread.cwd else "Без рабочей папки"
-            item = QListWidgetItem(f"{thread.title}\n{folder}")
+            metadata = folder
+            if thread.updated_at > 0:
+                updated = QDateTime.fromSecsSinceEpoch(thread.updated_at).toLocalTime()
+                metadata += "  ·  " + updated.toString("dd MMM, HH:mm")
+            active = thread.status not in {"", "notLoaded", "idle", "completed"}
+            title = ("●  " if active else "") + thread.title
+            item = QListWidgetItem(f"{title}\n{metadata}")
             item.setSizeHint(QSize(0, 54))
             item.setData(Qt.ItemDataRole.UserRole, thread.id)
             item.setData(int(Qt.ItemDataRole.UserRole) + 1, thread.cwd)
+            item.setData(
+                THREAD_SEARCH_ROLE,
+                f"{thread.title} {folder} {thread.cwd} {localized_status(thread.status)}".casefold(),
+            )
+            item.setData(THREAD_TITLE_ROLE, thread.title)
             item.setToolTip(f"{thread.cwd}\n{thread.id}")
             self.thread_list.addItem(item)
             if thread.id == selected:
                 self.thread_list.setCurrentItem(item)
         self.thread_list.blockSignals(False)
+        self._filter_threads(self.thread_search.text())
+
+    def _filter_threads(self, query: str) -> None:
+        normalized = " ".join(query.casefold().split())
+        for index in range(self.thread_list.count()):
+            item = self.thread_list.item(index)
+            haystack = str(item.data(THREAD_SEARCH_ROLE) or item.text()).casefold()
+            item.setHidden(bool(normalized) and normalized not in haystack)
 
     def _thread_activated(self, item: QListWidgetItem | None) -> None:
         if item:
@@ -1299,7 +1490,7 @@ class MainWindow(QMainWindow):
                 cwd = str(item.data(int(Qt.ItemDataRole.UserRole) + 1) or "")
                 if not self._switch_to_thread_project(cwd):
                     return
-                self.chat_title.setText(item.text().splitlines()[0])
+                self.chat_title.setText(str(item.data(THREAD_TITLE_ROLE) or item.text().splitlines()[0]))
                 self.service.open_thread(thread_id)
 
     def _switch_to_thread_project(self, cwd: str) -> bool:
@@ -1362,6 +1553,76 @@ class MainWindow(QMainWindow):
         self.model_combo.blockSignals(False)
         self._model_changed(self.model_combo.currentIndex())
 
+    def _build_request_settings_menu(self) -> QMenu:
+        menu = QMenu(self)
+        menu.setObjectName("requestSettingsMenu")
+        arrow_path = str(
+            files("codex_gui").joinpath("assets", "chevron-right.svg")
+        ).replace("\\", "/")
+        menu.setStyleSheet(
+            f"""
+            QMenu#requestSettingsMenu::item {{
+                min-width: 170px;
+                padding: 8px 36px 8px 12px;
+            }}
+            QMenu#requestSettingsMenu::right-arrow {{
+                image: url("{arrow_path}");
+                width: 12px;
+                height: 12px;
+                subcontrol-origin: padding;
+                subcontrol-position: right center;
+                right: 10px;
+            }}
+            """
+        )
+
+        selected_model = self._selected_model()
+        model_menu = QMenu(
+            selected_model.display_name if selected_model else "Модель",
+            menu,
+        )
+        model_menu.setObjectName("modelSettingsMenu")
+        menu.addMenu(model_menu)
+        for index, model in enumerate(self.models):
+            action = model_menu.addAction(model.display_name)
+            action.setCheckable(True)
+            action.setChecked(index == self.model_combo.currentIndex())
+            action.triggered.connect(
+                lambda _checked=False, target=index: self.model_combo.setCurrentIndex(target)
+            )
+        if not self.models:
+            unavailable = model_menu.addAction("Модели ещё загружаются…")
+            unavailable.setEnabled(False)
+
+        current_effort = self.effort_combo.currentData()
+        effort_menu = QMenu(effort_title(current_effort), menu)
+        effort_menu.setObjectName("effortSettingsMenu")
+        menu.addMenu(effort_menu)
+        for index in range(self.effort_combo.count()):
+            value = self.effort_combo.itemData(index)
+            action = effort_menu.addAction(effort_title(value))
+            action.setCheckable(True)
+            action.setChecked(index == self.effort_combo.currentIndex())
+            action.triggered.connect(
+                lambda _checked=False, target=index: self.effort_combo.setCurrentIndex(target)
+            )
+        if not self.effort_combo.count():
+            unavailable = effort_menu.addAction("Недоступно для текущей модели")
+            unavailable.setEnabled(False)
+        # Keep Python wrappers alive for the lifetime of the parent menu.
+        # PySide can otherwise release dynamically created submenu wrappers.
+        menu._request_submenus = (model_menu, effort_menu)  # type: ignore[attr-defined]
+        return menu
+
+    def _show_request_settings_menu(self) -> None:
+        menu = self._build_request_settings_menu()
+        menu.ensurePolished()
+        size = menu.sizeHint()
+        position = self.settings_button.mapToGlobal(
+            QPoint(self.settings_button.width() - size.width(), -size.height() - 6)
+        )
+        menu.exec(position)
+
     def _model_changed(self, index: int) -> None:
         if index < 0 or index >= len(self.models):
             return
@@ -1391,7 +1652,7 @@ class MainWindow(QMainWindow):
         selected = str(self.access_combo.currentData())
         if selected == PLAN_MODE_VALUE:
             self.settings.set("run_mode", PLAN_MODE_VALUE)
-            self.access_combo.setToolTip("Plan Mode: анализ и планирование без изменения файлов")
+            self._refresh_access_style()
             self._note_next_request_setting()
             return
         try:
@@ -1413,14 +1674,36 @@ class MainWindow(QMainWindow):
             self._danger_acknowledged = True
         self.settings.access_mode = mode
         self.settings.set("run_mode", mode.value)
-        self.access_combo.setToolTip("")
+        self._refresh_access_style()
         self._note_next_request_setting()
+
+    def _refresh_access_style(self) -> None:
+        selected = str(self.access_combo.currentData() or AccessMode.WORKSPACE_WRITE.value)
+        mode = {
+            AccessMode.READ_ONLY.value: "safe",
+            AccessMode.WORKSPACE_WRITE.value: "workspace",
+            AccessMode.FULL_ACCESS.value: "danger",
+            PLAN_MODE_VALUE: "plan",
+        }.get(selected, "workspace")
+        descriptions = {
+            AccessMode.READ_ONLY.value: "Только чтение: Codex не сможет изменять файлы",
+            AccessMode.WORKSPACE_WRITE.value: "Рабочая папка: изменения разрешены только внутри проекта",
+            AccessMode.FULL_ACCESS.value: "Полный доступ: команды выполняются без дополнительных подтверждений",
+            PLAN_MODE_VALUE: "Режим планирования: анализ без изменения файлов",
+        }
+        suffix = "\nПрименится к следующему сообщению" if self._turn_active else ""
+        self.access_combo.setToolTip(descriptions.get(selected, "") + suffix)
+        self.access_combo.setProperty("mode", mode)
+        self.access_combo.setProperty("nextTurn", self._turn_active)
+        self.access_combo.style().unpolish(self.access_combo)
+        self.access_combo.style().polish(self.access_combo)
 
     def _note_next_request_setting(self) -> None:
         if self._turn_active:
-            self.statusBar().showMessage(
-                "Настройка сохранена и применится к следующему сообщению",
-                3500,
+            self._show_notice(
+                "Настройка сохранена и применится к следующему сообщению.",
+                "info",
+                4500,
             )
 
     def _composer_text_changed(self) -> None:
@@ -1579,6 +1862,9 @@ class MainWindow(QMainWindow):
             self._render_attachments()
 
     def _send(self) -> None:
+        if self._editing_queued_message is not None:
+            self._save_queue_edit()
+            return
         text = self.composer.toPlainText().strip()
         if not text and not self.attachments:
             return
@@ -1592,7 +1878,10 @@ class MainWindow(QMainWindow):
     def _execute_slash_command(self, name: str, arguments: str, syntax: str) -> None:
         command = SLASH_COMMANDS_BY_NAME[name]
         if command.needs_thread and not getattr(self.service, "current_thread_id", ""):
-            self.statusBar().showMessage("Команда недоступна: сначала создайте текущий чат", 5000)
+            self._show_notice(
+                "Команда недоступна: сначала создайте или откройте чат.",
+                "warning",
+            )
             return
         if name == "help":
             self._show_slash_help()
@@ -1614,10 +1903,6 @@ class MainWindow(QMainWindow):
         if self._turn_active or self._queue_action_pending or not self.plan_confirmation_card.isHidden():
             self._message_queue.append(queued)
             self._render_message_queue()
-            self.statusBar().showMessage(
-                f"Команда добавлена в очередь · {len(self._message_queue)}",
-                4000,
-            )
             return
         self._dispatch_command(queued)
 
@@ -1634,9 +1919,10 @@ class MainWindow(QMainWindow):
         if not getattr(self.service, "current_project", ""):
             self._add_project()
             if not getattr(self.service, "current_project", ""):
-                self.statusBar().showMessage(
-                    "Сообщение сохранено в редакторе — выберите рабочую папку",
-                    5000,
+                self._show_notice(
+                    "Сообщение сохранено в редакторе — выберите рабочую папку.",
+                    "warning",
+                    6000,
                 )
                 return
         invalid = [str(item.path) for item in self.attachments if not item.path.is_file()]
@@ -1676,10 +1962,6 @@ class MainWindow(QMainWindow):
         if self._turn_active or self._queue_action_pending:
             self._message_queue.append(message)
             self._render_message_queue()
-            self.statusBar().showMessage(
-                f"Сообщение добавлено в очередь · {len(self._message_queue)}",
-                4000,
-            )
             return
         if not self.plan_confirmation_card.isHidden():
             self._dismiss_plan_confirmation(send_queued=False)
@@ -1687,7 +1969,11 @@ class MainWindow(QMainWindow):
 
     def _dispatch_message(self, message: QueuedMessage) -> bool:
         if getattr(self.service, "connected", True) is False:
-            self.statusBar().showMessage("Очередь приостановлена: Codex не подключен", 5000)
+            self._show_notice(
+                "Очередь приостановлена: Codex не подключён.",
+                "warning",
+                6000,
+            )
             self._queue_paused = True
             self._render_message_queue()
             return False
@@ -1736,7 +2022,13 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self._send_next_queued)
 
     def _send_next_queued(self) -> None:
-        if self._turn_active or self._queue_action_pending or self._queue_paused or not self._message_queue:
+        if (
+            self._turn_active
+            or self._queue_action_pending
+            or self._queue_paused
+            or self._editing_queued_message is not None
+            or not self._message_queue
+        ):
             return
         if not self.plan_confirmation_card.isHidden() or not self.user_input_card.isHidden():
             return
@@ -1757,10 +2049,109 @@ class MainWindow(QMainWindow):
 
     def _remove_queued_message(self, index: int) -> None:
         if 0 <= index < len(self._message_queue):
+            if self._message_queue[index] is self._editing_queued_message:
+                self._finish_queue_edit(resume_queue=False)
             self._message_queue.pop(index)
             self._render_message_queue()
 
+    def _edit_queued_message(self, index: int) -> None:
+        if not (0 <= index < len(self._message_queue)):
+            return
+        queued = self._message_queue[index]
+        if isinstance(queued, QueuedCommand):
+            return
+        if queued is self._editing_queued_message:
+            self.composer.setFocus()
+            return
+        if self._editing_queued_message is not None:
+            self._finish_queue_edit(resume_queue=False)
+        self._editing_queued_message = queued
+        self._queue_edit_draft_text = self.composer.toPlainText()
+        self._queue_edit_draft_attachments = list(self.attachments)
+        self.attachments.clear()
+        self._render_attachments()
+        self.composer.setPlainText(queued.text)
+        cursor = self.composer.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.composer.setTextCursor(cursor)
+        queue_index = self._message_queue.index(queued) + 1
+        attachment_note = (
+            f" · Вложений: {len(queued.attachments)}"
+            if queued.attachments
+            else ""
+        )
+        self.queue_edit_detail.setText(
+            f"Сообщение №{queue_index}{attachment_note} · Ctrl+Enter — сохранить"
+        )
+        self.queue_edit_banner.setVisible(True)
+        self.attach_button.setEnabled(False)
+        self.access_combo.setEnabled(False)
+        self.settings_button.setEnabled(False)
+        composer_panel = self.composer.parentWidget()
+        if composer_panel is not None:
+            composer_panel.setProperty("editingQueue", True)
+            composer_panel.style().unpolish(composer_panel)
+            composer_panel.style().polish(composer_panel)
+        self._refresh_send_button()
+        self._render_message_queue()
+        self.composer.setFocus()
+
+    def _save_queue_edit(self) -> None:
+        queued = self._editing_queued_message
+        if queued is None or queued not in self._message_queue:
+            self._finish_queue_edit()
+            return
+        index = self._message_queue.index(queued)
+        if self._update_queued_message(index, self.composer.toPlainText()):
+            self._finish_queue_edit()
+
+    def _cancel_queue_edit(self) -> None:
+        self._finish_queue_edit()
+
+    def _finish_queue_edit(self, *, resume_queue: bool = True) -> None:
+        if self._editing_queued_message is None:
+            return
+        self._editing_queued_message = None
+        self.queue_edit_banner.setVisible(False)
+        self.composer.setPlainText(self._queue_edit_draft_text)
+        self.attachments = list(self._queue_edit_draft_attachments)
+        self._queue_edit_draft_text = ""
+        self._queue_edit_draft_attachments.clear()
+        self._render_attachments()
+        self.attach_button.setEnabled(True)
+        self.access_combo.setEnabled(True)
+        self.settings_button.setEnabled(True)
+        composer_panel = self.composer.parentWidget()
+        if composer_panel is not None:
+            composer_panel.setProperty("editingQueue", False)
+            composer_panel.style().unpolish(composer_panel)
+            composer_panel.style().polish(composer_panel)
+        self._refresh_send_button()
+        self._render_message_queue()
+        if resume_queue:
+            QTimer.singleShot(0, self._send_next_queued)
+
+    def _update_queued_message(self, index: int, text: str) -> bool:
+        if not (0 <= index < len(self._message_queue)):
+            return False
+        queued = self._message_queue[index]
+        if isinstance(queued, QueuedCommand):
+            return False
+        normalized = text.strip()
+        if not normalized and not queued.attachments:
+            self._show_notice(
+                "Сообщение без текста или вложений нельзя сохранить.",
+                "warning",
+            )
+            return False
+        queued.text = normalized
+        if queued.queue_syntax and queued.queue_syntax.startswith("/plan"):
+            queued.queue_syntax = "/plan" + (f" {normalized}" if normalized else "")
+        self._render_message_queue()
+        return True
+
     def _clear_message_queue(self) -> None:
+        self._finish_queue_edit(resume_queue=False)
         self._message_queue.clear()
         self._queue_paused = False
         self._render_message_queue()
@@ -1771,26 +2162,73 @@ class MainWindow(QMainWindow):
             if item.widget():
                 item.widget().deleteLater()
         count = len(self._message_queue)
-        state = "ПРИОСТАНОВЛЕНА" if self._queue_paused else "ОЧЕРЕДЬ"
+        state = (
+            "РЕДАКТИРОВАНИЕ"
+            if self._editing_queued_message is not None
+            else "ПРИОСТАНОВЛЕНА"
+            if self._queue_paused
+            else "ОЧЕРЕДЬ"
+        )
         self.queue_label.setText(f"{state}  ·  {count}")
         for index, queued in enumerate(self._message_queue):
             if isinstance(queued, QueuedCommand):
                 preview = queued.syntax
+                full_text = preview
             else:
                 preview = queued.queue_syntax or " ".join(queued.text.split()) or "Вложения"
+                full_text = queued.queue_syntax or queued.text or "Вложения"
+                if queued.attachments:
+                    suffix = f" · {len(queued.attachments)} влож."
+                    preview += suffix
             if len(preview) > 90:
                 preview = preview[:87] + "…"
-            button = QToolButton()
-            button.setObjectName("queueItemButton")
-            button.setText(f"{index + 1}. {preview}   ×")
-            button.setToolTip("Удалить это сообщение из очереди")
-            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
-            button.clicked.connect(
+            row = QFrame()
+            row.setObjectName("queueItem")
+            editing = queued is self._editing_queued_message
+            row.setProperty("editing", editing)
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(8, 5, 5, 5)
+            row_layout.setSpacing(7)
+            number = QLabel(str(index + 1))
+            number.setObjectName("queueItemIndex")
+            number.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            number.setFixedSize(22, 22)
+            row_layout.addWidget(number)
+            text = QLabel(preview)
+            text.setObjectName("queueItemText")
+            text.setToolTip(full_text)
+            text.setWordWrap(True)
+            text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            row_layout.addWidget(text, 1)
+            if not isinstance(queued, QueuedCommand):
+                edit = QToolButton()
+                edit.setObjectName("queueItemAction")
+                edit.setIcon(asset_icon("edit.svg"))
+                edit.setToolTip("Редактировать сообщение")
+                edit.setAccessibleName(f"Редактировать сообщение {index + 1}")
+                edit.setFixedSize(28, 28)
+                edit.setEnabled(not editing)
+                edit.clicked.connect(
+                    lambda _checked=False, target=index: self._edit_queued_message(target)
+                )
+                row_layout.addWidget(edit)
+            remove = QToolButton()
+            remove.setObjectName("queueItemAction")
+            remove.setIcon(asset_icon("remove.svg"))
+            remove.setToolTip("Удалить из очереди")
+            remove.setAccessibleName(f"Удалить элемент {index + 1} из очереди")
+            remove.setFixedSize(28, 28)
+            remove.setEnabled(not editing)
+            remove.clicked.connect(
                 lambda _checked=False, target=index: self._remove_queued_message(target)
             )
-            self.queue_items_layout.addWidget(button)
+            row_layout.addWidget(remove)
+            self.queue_items_layout.addWidget(row)
         self.queue_resume_button.setEnabled(
-            bool(count) and not self._turn_active and not self._queue_action_pending
+            bool(count)
+            and not self._turn_active
+            and not self._queue_action_pending
+            and self._editing_queued_message is None
         )
         self.queue_panel.setVisible(bool(count))
         navigation_enabled = not self._turn_active and not self._queue_action_pending
@@ -1857,7 +2295,39 @@ class MainWindow(QMainWindow):
             empty_layout.addWidget(glyph)
             empty_layout.addWidget(title)
             empty_layout.addWidget(description)
+            starter_title = QLabel("БЫСТРЫЙ СТАРТ")
+            starter_title.setObjectName("emptyStarterTitle")
+            starter_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            empty_layout.addWidget(starter_title)
+            for label, prompt in (
+                (
+                    "Объяснить структуру проекта",
+                    "Изучи проект и объясни его структуру, основные компоненты и точки входа.",
+                ),
+                (
+                    "Найти потенциальные ошибки",
+                    "Проверь проект на потенциальные ошибки и предложи исправления.",
+                ),
+                (
+                    "Проверить текущие изменения",
+                    "Проверь текущие изменения в рабочей папке и перечисли найденные проблемы.",
+                ),
+            ):
+                button = QPushButton(label)
+                button.setObjectName("starterButton")
+                button.setAccessibleName(label)
+                button.clicked.connect(
+                    lambda _checked=False, value=prompt: self._use_starter_prompt(value)
+                )
+                empty_layout.addWidget(button)
             self.timeline_layout.insertWidget(0, empty, 1, Qt.AlignmentFlag.AlignCenter)
+
+    def _use_starter_prompt(self, prompt: str) -> None:
+        self.composer.setPlainText(prompt)
+        cursor = self.composer.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.composer.setTextCursor(cursor)
+        self.composer.setFocus()
 
     def _remove_empty_hint(self) -> None:
         for index in range(self.timeline_layout.count() - 1):
@@ -1880,6 +2350,7 @@ class MainWindow(QMainWindow):
             else:
                 card.set_text(text)
         elif kind == "agentMessage":
+            self._set_thinking_activity("ИИ пишет ответ")
             text = str(item.get("text", ""))
             if not isinstance(card, MessageCard):
                 card = MessageCard("agent", text)
@@ -1887,6 +2358,7 @@ class MainWindow(QMainWindow):
             elif complete or text:
                 card.set_text(text)
         elif kind == "plan":
+            self._set_thinking_activity("ИИ составляет план")
             text = str(item.get("text", ""))
             if not isinstance(card, MessageCard):
                 card = MessageCard("agent", text)
@@ -1900,28 +2372,37 @@ class MainWindow(QMainWindow):
             ):
                 self._pending_plan_text = text
         elif kind == "reasoning":
+            self._set_thinking_activity("ИИ анализирует")
             summary = item.get("summary", [])
             text = "\n".join(summary) if isinstance(summary, list) else str(summary or item.get("content", ""))
             self._activity(item_id, "Размышления", text)
         elif kind == "commandExecution":
+            self._set_thinking_activity("ИИ выполняет команду")
             command = item.get("command", "Команда")
             if isinstance(command, list):
                 command = " ".join(map(str, command))
             output = str(item.get("aggregatedOutput") or "")
             status = item.get("status", "inProgress")
-            self._activity(item_id, f"Терминал · {status}: {command}", output)
+            self._activity(
+                item_id,
+                f"Терминал · {localized_status(status)}: {command}",
+                output,
+            )
         elif kind == "fileChange":
+            self._set_thinking_activity("ИИ изменяет файлы")
             changes = item.get("changes", [])
             paths = [str(change.get("path", "")) for change in changes if isinstance(change, dict)]
             diffs = [str(change.get("diff", "")) for change in changes if isinstance(change, dict)]
             self._activity(item_id, "Изменения файлов: " + ", ".join(paths), "\n".join(diffs))
         elif kind == "contextCompaction":
+            self._set_thinking_activity("ИИ сжимает контекст")
             self._activity(
                 item_id,
                 "Контекст сжат",
                 self._compact_item(item) or "История чата сжата для продолжения работы.",
             )
         elif kind == "enteredReviewMode":
+            self._set_thinking_activity("ИИ проверяет изменения")
             self._activity(
                 item_id,
                 "Режим ревью запущен",
@@ -1934,6 +2415,11 @@ class MainWindow(QMainWindow):
                 self._compact_item(item) or "Codex завершил проверку изменений.",
             )
         elif kind in {"mcpToolCall", "dynamicToolCall", "webSearch", "collabToolCall"}:
+            self._set_thinking_activity(
+                "ИИ ищет в интернете"
+                if kind == "webSearch"
+                else "ИИ использует инструмент"
+            )
             title = str(item.get("tool") or item.get("query") or item.get("type"))
             self._activity(item_id, title, self._compact_item(item))
         self._scroll_bottom()
@@ -1983,6 +2469,7 @@ class MainWindow(QMainWindow):
         return card
 
     def _agent_delta(self, item_id: str, delta: str) -> None:
+        self._set_thinking_activity("ИИ пишет ответ")
         card = self.cards.get(item_id)
         if not isinstance(card, MessageCard):
             card = MessageCard("agent")
@@ -1991,6 +2478,7 @@ class MainWindow(QMainWindow):
         self._scroll_bottom()
 
     def _plan_delta(self, item_id: str, delta: str) -> None:
+        self._set_thinking_activity("ИИ составляет план")
         card = self.cards.get(item_id)
         if not isinstance(card, MessageCard):
             card = MessageCard("agent")
@@ -1999,6 +2487,7 @@ class MainWindow(QMainWindow):
         self._scroll_bottom()
 
     def _turn_plan_updated(self, params: dict[str, Any]) -> None:
+        self._set_thinking_activity("ИИ обновляет план")
         turn_id = str(
             params.get("turnId")
             or getattr(self.service, "current_turn_id", "")
@@ -2019,12 +2508,14 @@ class MainWindow(QMainWindow):
         self._scroll_bottom()
 
     def _reasoning_delta(self, item_id: str, delta: str) -> None:
+        self._set_thinking_activity("ИИ анализирует")
         card = self.cards.get(item_id)
         if not isinstance(card, ActivityCard):
             card = self._activity(item_id, "Размышления", "")
         card.append(delta)
 
     def _command_delta(self, item_id: str, delta: str) -> None:
+        self._set_thinking_activity("ИИ выполняет команду")
         card = self.cards.get(item_id)
         if not isinstance(card, ActivityCard):
             card = self._activity(item_id, "Терминал", "")
@@ -2044,12 +2535,7 @@ class MainWindow(QMainWindow):
         self.header_status.style().unpolish(self.header_status)
         self.header_status.style().polish(self.header_status)
         self.send_button.setVisible(True)
-        self.send_button.setText("＋" if active else "↑")
-        self.send_button.setToolTip(
-            "Добавить сообщение в очередь · Ctrl+Enter"
-            if active
-            else "Отправить · Ctrl+Enter"
-        )
+        self._refresh_send_button()
         self.stop_button.setVisible(active)
         self.composer.setEnabled(True)
         self.new_chat_button.setEnabled(not active)
@@ -2057,9 +2543,16 @@ class MainWindow(QMainWindow):
         self.project_combo.setEnabled(not active)
         self.model_combo.setEnabled(True)
         self.effort_combo.setEnabled(True)
-        self.access_combo.setEnabled(True)
+        editing_queue = self._editing_queued_message is not None
+        self.attach_button.setEnabled(not editing_queue)
+        self.access_combo.setEnabled(not editing_queue)
+        self.settings_button.setEnabled(not editing_queue)
+        self._refresh_access_style()
         self._render_message_queue()
-        self.statusBar().showMessage("Codex работает…" if active else f"Ход: {status}", 4000)
+        self.statusBar().showMessage(
+            "Codex работает…" if active else f"Ход: {localized_status(status)}",
+            4000,
+        )
         if was_active and not active:
             self._clear_server_requests()
             elapsed_ms = self._turn_timer.elapsed() if self._turn_timer.isValid() else 0
@@ -2081,6 +2574,30 @@ class MainWindow(QMainWindow):
                 else:
                     QTimer.singleShot(0, self._send_next_queued)
             self._active_collaboration_mode = None
+
+    def _refresh_send_button(self) -> None:
+        if self._editing_queued_message is not None:
+            self.send_button.setIcon(asset_icon("save.svg"))
+            self.send_button.setToolTip(
+                "Сохранить изменения сообщения в очереди · Ctrl+Enter"
+            )
+            self.send_button.setAccessibleName(
+                "Сохранить изменения сообщения в очереди"
+            )
+            return
+        self.send_button.setIcon(
+            asset_icon("queue.svg" if self._turn_active else "send.svg")
+        )
+        self.send_button.setToolTip(
+            "Добавить сообщение в очередь · Ctrl+Enter"
+            if self._turn_active
+            else "Отправить · Ctrl+Enter"
+        )
+        self.send_button.setAccessibleName(
+            "Добавить сообщение в очередь"
+            if self._turn_active
+            else "Отправить сообщение"
+        )
 
     def _add_turn_duration(self, status: str, elapsed_ms: int) -> None:
         if status == "failed":
@@ -2122,6 +2639,11 @@ class MainWindow(QMainWindow):
             self._thinking_indicator.hide()
             self._thinking_indicator.deleteLater()
             self._thinking_indicator = None
+
+    def _set_thinking_activity(self, activity: str) -> None:
+        if self._turn_active and self._thinking_indicator is not None:
+            self._thinking_indicator.set_activity(activity)
+            self._move_thinking_to_bottom()
 
     def _move_thinking_to_bottom(self) -> None:
         if self._thinking_indicator is None:
@@ -2190,6 +2712,22 @@ class MainWindow(QMainWindow):
         x = max(0, (viewport.width() - self.scroll_down_button.width()) // 2)
         y = max(0, viewport.height() - self.scroll_down_button.height() - 14)
         self.scroll_down_button.move(x, y)
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        if not hasattr(self, "sidebar_panel"):
+            return
+        width = event.size().width()
+        if width <= SIDEBAR_AUTO_HIDE_WIDTH and not self.sidebar_panel.isHidden():
+            self._sidebar_auto_hidden = True
+            self._set_sidebar_visible(False)
+        elif (
+            width >= SIDEBAR_AUTO_SHOW_WIDTH
+            and self._sidebar_auto_hidden
+            and not self._sidebar_user_hidden
+        ):
+            self._sidebar_auto_hidden = False
+            self._set_sidebar_visible(True)
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if (
@@ -2280,29 +2818,58 @@ class MainWindow(QMainWindow):
     def _login_started(self, result: dict[str, Any]) -> None:
         if result.get("authUrl"):
             QDesktopServices.openUrl(QUrl(str(result["authUrl"])))
-            self.statusBar().showMessage("Завершите вход в браузере")
+            self._show_notice("Завершите вход в открывшемся браузере.", "info", 8000)
+
+    @staticmethod
+    def _permission_summary(permissions: object) -> str:
+        if not isinstance(permissions, dict) or not permissions:
+            return "Область дополнительных разрешений не указана."
+        labels = {
+            "network": "Доступ к сети",
+            "fileSystem": "Доступ к файловой системе",
+            "filesystem": "Доступ к файловой системе",
+            "writableRoots": "Дополнительные папки для записи",
+        }
+        lines: list[str] = []
+        for key, value in permissions.items():
+            label = labels.get(str(key), str(key))
+            if isinstance(value, dict):
+                enabled = value.get("enabled")
+                detail = "разрешён" if enabled is True else "запрещён" if enabled is False else "запрошен"
+                paths = value.get("writableRoots") or value.get("paths")
+                if isinstance(paths, list) and paths:
+                    detail += ": " + ", ".join(map(str, paths))
+            elif isinstance(value, list):
+                detail = ", ".join(map(str, value))
+            elif isinstance(value, bool):
+                detail = "разрешён" if value else "запрещён"
+            else:
+                detail = str(value)
+            lines.append(f"• {label}: {detail}")
+        return "\n".join(lines)
 
     def _approval_requested(self, request_id: object, method: str, params: dict[str, Any]) -> None:
+        self._set_thinking_activity("ИИ ждёт подтверждения")
+        project = getattr(self.service, "current_project", "") or "не выбрана"
+        reason = str(params.get("reason") or "Причина не указана.").strip()
         if "commandExecution" in method:
             command = params.get("command") or "Команда не указана"
             if isinstance(command, list):
                 command = " ".join(map(str, command))
             title = "Выполнение команды"
-            detail = f"{command}\n\n{params.get('reason', '')}"
+            detail = f"Команда:\n{command}\n\nРабочая папка: {project}\n\nЗачем это нужно:\n{reason}"
         elif "fileChange" in method:
             title = "Изменение файлов"
-            detail = f"Codex запрашивает разрешение на изменение файлов.\n\n{params.get('reason', '')}"
+            paths = params.get("paths") or params.get("files") or []
+            affected = "\n".join(f"• {path}" for path in paths) if isinstance(paths, list) else str(paths)
+            scope = affected or f"Внутри проекта: {project}"
+            detail = f"Codex запрашивает изменение файлов.\n\nОбласть:\n{scope}\n\nЗачем это нужно:\n{reason}"
         else:
             title = "Дополнительные разрешения"
-            permissions = params.get("permissions", {})
-            rendered_permissions = (
-                json.dumps(permissions, ensure_ascii=False, indent=2)
-                if isinstance(permissions, dict)
-                else str(permissions)
-            )
             detail = (
-                "Codex запрашивает дополнительные разрешения.\n\n"
-                f"{params.get('reason', '')}\n\nЗапрошено:\n{rendered_permissions}"
+                "Codex запрашивает доступ за пределами обычного режима.\n\n"
+                f"Запрошено:\n{self._permission_summary(params.get('permissions', {}))}"
+                f"\n\nЗачем это нужно:\n{reason}"
             )
         self._approval_queue.append(
             ApprovalPrompt(request_id, method, params, title, detail)
@@ -2338,6 +2905,7 @@ class MainWindow(QMainWindow):
         self._show_next_approval()
 
     def _user_input_requested(self, request_id: object, params: dict[str, Any]) -> None:
+        self._set_thinking_activity("ИИ ждёт ответа")
         self._user_input_queue.append((request_id, params))
         self._show_next_user_input()
         questions = params.get("questions", [])

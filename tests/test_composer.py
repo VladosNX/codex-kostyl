@@ -51,8 +51,10 @@ def test_message_card_has_no_author_label_and_copies_full_text(qtbot) -> None:
     qtbot.addWidget(card)
 
     assert not any(label.text() in {"ВЫ", "CODEX"} for label in card.findChildren(QLabel))
-    assert card.copy_button.text() == "⧉"
-    assert card.edit_button is not None and card.edit_button.text() == "✎"
+    assert card.copy_button.icon().isNull() is False
+    assert card.copy_button.accessibleName() == "Скопировать сообщение"
+    assert card.edit_button is not None and card.edit_button.icon().isNull() is False
+    assert card.edit_button.accessibleName() == "Редактировать сообщение"
     card.copy_button.click()
     assert QApplication.clipboard().text() == "Полный текст"
 
@@ -94,6 +96,8 @@ def test_thinking_indicator_animates(qtbot) -> None:
 
     indicator.start()
     qtbot.waitUntil(lambda: indicator.label.text() != initial, timeout=1200)
+    indicator.set_activity("ИИ выполняет команду")
+    assert "ИИ выполняет команду" in indicator.label.text()
     indicator.stop()
 
 
