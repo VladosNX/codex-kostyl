@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QObject, Qt, Signal
+from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import QLabel, QMessageBox, QWidget
 
 from codex_gui.main_window import MainWindow, QueuedCommand
@@ -318,6 +319,36 @@ def test_slash_panel_appears_filters_and_shows_unavailable_reason(qtbot) -> None
 
     window.composer.setPlainText("/review инструкция")
     assert window.slash_panel.isHidden() is True
+
+
+def test_slash_panel_uses_prefix_before_cursor_and_preserves_existing_prompt(qtbot) -> None:
+    window, service = make_window(qtbot)
+    existing_prompt = "Подготовь план миграции базы"
+    window.composer.setPlainText(existing_prompt)
+    cursor = window.composer.textCursor()
+    cursor.movePosition(QTextCursor.MoveOperation.Start)
+    window.composer.setTextCursor(cursor)
+
+    qtbot.keyClicks(window.composer, "/pl")
+
+    assert window.slash_panel.isHidden() is False
+    assert window.slash_panel.selected_command() == "plan"
+
+    qtbot.keyClick(window.composer, Qt.Key.Key_Tab)
+
+    assert window.composer.toPlainText() == f"/plan {existing_prompt}"
+    assert window.composer.textCursor().position() == len("/plan ")
+    assert window.slash_panel.isHidden() is True
+
+    window.composer.setPlainText(existing_prompt)
+    cursor = window.composer.textCursor()
+    cursor.movePosition(QTextCursor.MoveOperation.Start)
+    window.composer.setTextCursor(cursor)
+    qtbot.keyClicks(window.composer, "/pl")
+    qtbot.keyClick(window.composer, Qt.Key.Key_Return)
+
+    assert service.sent[-1][0] == existing_prompt
+    assert service.sent[-1][5] == PLAN_MODE_VALUE
 
 
 def test_slash_panel_keyboard_tab_enter_escape_and_click(qtbot) -> None:

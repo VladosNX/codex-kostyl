@@ -1185,6 +1185,7 @@ class MainWindow(QMainWindow):
         self.composer.filesDropped.connect(self._add_attachments)
         self.composer.sendRequested.connect(self._send)
         self.composer.textChanged.connect(self._composer_text_changed)
+        self.composer.cursorPositionChanged.connect(self._update_slash_panel)
         self.composer.slashNavigate.connect(self._navigate_slash_commands)
         self.composer.slashComplete.connect(self._complete_slash_command)
         self.composer.slashActivate.connect(self.slash_panel.activate_selected)
@@ -1434,11 +1435,20 @@ class MainWindow(QMainWindow):
         if self._slash_help_visible and not text:
             prefix = "/"
         else:
-            if not text.startswith("/") or any(character.isspace() for character in text):
+            cursor_position = self.composer.textCursor().position()
+            prefix = text[:cursor_position]
+            # setPlainText() leaves the cursor at the start. Keep programmatic
+            # command insertion useful when the whole value is a command prefix.
+            if cursor_position == 0 and text.startswith("/") and not any(
+                character.isspace() for character in text
+            ):
+                prefix = text
+            if not prefix.startswith("/") or any(
+                character.isspace() for character in prefix
+            ):
                 return []
             if text == self._slash_dismissed_text:
                 return []
-            prefix = text
         has_thread = bool(getattr(self.service, "current_thread_id", ""))
         matches: list[tuple[SlashCommand, bool, str]] = []
         for command in SLASH_COMMANDS:
@@ -1470,12 +1480,30 @@ class MainWindow(QMainWindow):
         selected = self.slash_panel.selected_command()
         if not selected:
             return
-        command = SLASH_COMMANDS_BY_NAME[selected]
-        completion = command.syntax + (" " if command.accepts_arguments else "")
-        self.composer.setPlainText(completion)
+        self._insert_slash_completion(selected)
+
+    def _insert_slash_completion(self, name: str) -> str:
+        command = SLASH_COMMANDS_BY_NAME[name]
+        text = self.composer.toPlainText()
+        cursor_position = self.composer.textCursor().position()
+        if cursor_position == 0 and text.startswith("/") and not any(
+            character.isspace() for character in text
+        ):
+            cursor_position = len(text)
+        suffix = text[cursor_position:]
+        if command.accepts_arguments:
+            completion = command.syntax + " "
+            suffix = suffix.lstrip(" ")
+        else:
+            completion = command.syntax
+            if suffix and not suffix[0].isspace():
+                completion += " "
+        completed_text = completion + suffix
+        self.composer.setPlainText(completed_text)
         cursor = self.composer.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.setPosition(len(completion))
         self.composer.setTextCursor(cursor)
+        return completed_text
 
     def _dismiss_slash_panel(self) -> None:
         self._slash_dismissed_text = self.composer.toPlainText()
@@ -1484,7 +1512,8 @@ class MainWindow(QMainWindow):
         self.composer.set_slash_menu_state(False, False)
 
     def _activate_slash_command(self, name: str) -> None:
-        self._execute_slash_command(name, "", f"/{name}")
+        self._insert_slash_completion(name)
+        self._send()
 
     def _show_slash_help(self) -> None:
         self.composer.clear()
