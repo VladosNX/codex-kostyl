@@ -1,3 +1,4 @@
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QLabel
 
 from codex_gui.main_window import (
@@ -29,6 +30,22 @@ def test_composer_grows_with_content_and_shrinks_when_cleared(qtbot) -> None:
 
     composer.clear()
     qtbot.waitUntil(lambda: composer.height() == Composer.MIN_HEIGHT)
+
+
+def test_enter_sends_and_shift_enter_adds_new_line(qtbot) -> None:
+    composer = Composer()
+    qtbot.addWidget(composer)
+    composer.setPlainText("Сообщение")
+
+    with qtbot.waitSignal(composer.sendRequested):
+        qtbot.keyClick(composer, Qt.Key.Key_Return)
+
+    qtbot.keyClick(
+        composer,
+        Qt.Key.Key_Return,
+        modifier=Qt.KeyboardModifier.ShiftModifier,
+    )
+    assert "\n" in composer.toPlainText()
 
 
 def test_message_streaming_is_rendered_in_batches(qtbot) -> None:

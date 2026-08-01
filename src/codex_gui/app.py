@@ -45,7 +45,7 @@ QSplitter::handle { background: #2a2d2d; }
 #projectBubbleButton:hover { background: #363b38; color: #fff; }
 #iconButton, #attachButton { background: transparent; border: 0; border-radius: 7px; color: #a9ada8; font-size: 18px; padding: 0; }
 #iconButton:hover, #attachButton:hover { background: #2a2d2d; color: #fff; }
-#newChatButton { background: #ededeb; color: #171918; border: 0; border-radius: 8px; padding: 9px 12px; text-align: left; font-weight: 650; }
+#newChatButton { background: #ededeb; color: #171918; border: 0; border-radius: 8px; padding: 9px 58px 9px 12px; text-align: left; font-weight: 650; }
 #newChatButton:hover { background: #fff; }
 #newChatButton:pressed { background: #d7d8d4; }
 #newChatButton:disabled { background: #2a2c2c; color: #6d716e; }
@@ -61,7 +61,12 @@ QSplitter::handle { background: #2a2d2d; }
 #chatTitle { color: #f3f3f0; font-size: 14px; font-weight: 650; }
 #chatContext { color: #969c97; font-size: 11px; }
 #sidebarToggle, #settingsButton { background: transparent; border: 0; border-radius: 7px; padding: 4px; }
+#sidebarToggle, #settingsButton { color: #969d98; font-family: monospace; font-size: 11px; }
 #sidebarToggle:hover, #settingsButton:hover { background: #292d2b; }
+#inlineShortcutLabel { color: #939a95; background: transparent; border: 0; font-family: monospace; font-size: 11px; }
+#inlineShortcutLabel:disabled { color: #606662; }
+#newChatButton #inlineShortcutLabel { color: #666c68; font-size: 13px; }
+#newChatButton:disabled #inlineShortcutLabel { color: #6d716e; }
 #readyStatus { color: #86a992; background: #18231d; border: 1px solid #283c30; border-radius: 10px; padding: 4px 9px; font-size: 11px; }
 #readyStatus[active="true"] { color: #d3b778; background: #282318; border-color: #493d25; }
 #contextUsage { background: transparent; }
@@ -95,13 +100,14 @@ QSplitter::handle { background: #2a2d2d; }
 #slashCommandList::item:disabled { color: #666b67; background: transparent; }
 #optionCombo { background: transparent; color: #9ca19c; border: 0; border-radius: 6px; padding: 5px 7px; min-height: 20px; font-size: 11px; }
 #optionCombo:hover, #optionCombo:on { background: #292c2c; color: #e8e8e5; }
-#accessCombo { color: #d4ddd7; background: #202a24; border: 1px solid #385044; border-radius: 8px; padding: 5px 8px; min-height: 20px; font-size: 11px; }
+#accessCombo { color: #d4ddd7; background: #202a24; border: 1px solid #385044; border-radius: 8px; padding: 5px 70px 5px 8px; min-height: 20px; font-size: 11px; }
 #accessCombo[mode="safe"] { color: #b8d8c2; background: #18251e; border-color: #31503c; }
 #accessCombo[mode="workspace"] { color: #d4ddd7; background: #202a24; border-color: #385044; }
 #accessCombo[mode="neutral"] { color: #d2d5d2; background: #252827; border-color: #444a47; }
 #accessCombo[mode="plan"] { color: #d2c9eb; background: #251f32; border-color: #51436d; }
 #accessCombo[mode="danger"] { color: #efb8b2; background: #301e1e; border-color: #70413d; }
 #accessCombo[nextTurn="true"] { border-style: dashed; }
+#accessCombo #inlineShortcutLabel { font-size: 9px; }
 #weeklyLimit { background: transparent; }
 #weeklyLimitLabel { color: #a1a6a1; font-size: 11px; }
 #weeklyLimitProgress { background: #303432; border: 0; border-radius: 2px; }
@@ -140,7 +146,8 @@ QSplitter::handle { background: #2a2d2d; }
 #turnDuration[result="failed"] { color: #b77b76; }
 #turnDuration[result="stopped"] { color: #a18e68; }
 #activityGroup { background: #171919; border: 1px solid #292d2b; border-radius: 9px; }
-#activityGroupTitle { background: transparent; border: 0; color: #959c96; font-size: 10px; font-weight: 700; letter-spacing: 1px; padding: 10px 13px 8px 13px; text-align: left; }
+#activityGroupTitle { background: transparent; border: 0; color: #959c96; font-size: 10px; font-weight: 700; letter-spacing: 1px; padding: 10px 58px 8px 13px; text-align: left; }
+#activityGroupTitle #inlineShortcutLabel { font-size: 10px; letter-spacing: 0; }
 #activityGroupTitle:hover { color: #d7dad6; background: #1e2120; }
 #activityGroupItems { background: transparent; }
 #activityCard { background: transparent; border: 0; border-top: 1px solid #292d2b; border-radius: 0; }

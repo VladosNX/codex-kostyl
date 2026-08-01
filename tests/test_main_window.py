@@ -18,7 +18,7 @@ from codex_gui.agents.base import (
     FeatureState,
     FeatureSupport,
 )
-from codex_gui.main_window import MainWindow, QueuedCommand
+from codex_gui.main_window import MainWindow, NumberedChoiceMenu, QueuedCommand
 from codex_gui.models import PLAN_MODE_VALUE, AccessMode, Attachment, ModelInfo, ThreadSummary
 
 
@@ -520,14 +520,14 @@ def test_request_settings_use_nested_model_and_effort_menus(qtbot) -> None:
     model_menu = menu.actions()[0].menu()
     effort_menu = menu.actions()[1].menu()
 
-    assert model_menu is not None and model_menu.title() == "Model A"
-    assert effort_menu is not None and effort_menu.title() == "Low effort"
+    assert model_menu is not None and model_menu.title() == "1   Model A"
+    assert effort_menu is not None and effort_menu.title() == "2   Low effort"
     model_menu.actions()[1].trigger()
     assert window.model_combo.currentData() == "model-b"
 
     menu = window._build_request_settings_menu()
     effort_menu = menu.actions()[1].menu()
-    assert effort_menu is not None and effort_menu.title() == "Medium effort"
+    assert effort_menu is not None and effort_menu.title() == "2   Medium effort"
     effort_menu.actions()[1].trigger()
 
     assert window.effort_combo.currentData() == "high"
@@ -539,6 +539,8 @@ def test_access_mode_has_semantic_style_and_active_turn_notice(qtbot) -> None:
     window.access_combo.setCurrentIndex(window.access_combo.findData(PLAN_MODE_VALUE))
 
     assert window.access_combo.property("mode") == "plan"
+    assert window.access_shortcut_label.property("accessTone") == "plan"
+    assert "#d2c9eb" in window.access_shortcut_label.styleSheet()
     assert window.access_combo.property("nextTurn") is True
     assert "следующему сообщению" in window.notice_label.text()
     assert window.notice_banner.isHidden() is False
@@ -569,6 +571,235 @@ def test_sidebar_can_be_collapsed_with_header_control(qtbot) -> None:
 
     window.sidebar_toggle.click()
     assert window.sidebar_panel.isHidden() is False
+
+
+def test_application_shortcuts_are_registered(qtbot) -> None:
+    window, _service = make_window(qtbot)
+
+    assert window.new_chat_shortcut.key().toString() == "Ctrl+K"
+    assert window.access_mode_shortcut.key().toString() == "Ctrl+M"
+    assert window.attach_file_shortcut.key().toString() == "Ctrl+O"
+    assert window.request_settings_shortcut.key().toString() == "Ctrl+I"
+    assert window.latest_activity_shortcut.key().toString() == "Ctrl+T"
+    assert window.stop_shortcut.key().toString() == "Esc"
+    inline_shortcuts = {
+        label.text()
+        for label in window.findChildren(QLabel, "inlineShortcutLabel")
+    }
+    assert inline_shortcuts == {"Ctrl+K", "Ctrl+M"}
+    assert window.sidebar_toggle.text() == "Ctrl+B"
+    assert window.settings_button.text() == "Ctrl+I"
+    assert "Ctrl+O" not in inline_shortcuts
+    assert "Enter" not in inline_shortcuts
+    assert "Esc" not in inline_shortcuts
+
+
+def test_new_chat_and_attach_shortcuts_call_safe_actions(qtbot) -> None:
+    window, service = make_window(qtbot)
+    attachments_opened: list[bool] = []
+    window._choose_attachments = lambda: attachments_opened.append(True)  # type: ignore[method-assign]
+
+    window.new_chat_shortcut.activated.emit()
+    window.attach_file_shortcut.activated.emit()
+
+    assert service.actions[-1][0] == "new"
+    assert attachments_opened == [True]
+
+
+def test_access_mode_menu_supports_number_selection(qtbot) -> None:
+    window, _service = make_window(qtbot)
+    menu = window._build_access_mode_menu()
+    menu.show()
+
+    qtbot.keyClick(menu, Qt.Key.Key_1)
+
+    assert window.access_combo.currentData() == AccessMode.READ_ONLY.value
+
+
+def test_access_combo_click_uses_always_numbered_menu(qtbot, monkeypatch) -> None:
+    window, _service = make_window(qtbot)
+    visible_actions: list[list[str]] = []
+
+    monkeypatch.setattr(
+        NumberedChoiceMenu,
+        "exec",
+        lambda menu, *_args: visible_actions.append(
+            [action.text() for action in menu.actions()]
+        ),
+    )
+
+    window.access_combo.showPopup()
+
+    assert visible_actions
+    assert all(
+        text.startswith(f"{index}   ")
+        for index, text in enumerate(visible_actions[0], start=1)
+    )
+
+
+def test_request_settings_menu_supports_number_selection(qtbot) -> None:
+    window, _service = make_window(qtbot)
+    window._set_models(
+        [
+            ModelInfo("model-a", "Model A", ["low"], "low"),
+            ModelInfo("model-b", "Model B", ["medium", "high"], "medium"),
+        ]
+    )
+
+    menu = window._build_request_settings_menu()
+    model_menu = menu.actions()[0].menu()
+    assert isinstance(model_menu, NumberedChoiceMenu)
+    model_menu.show()
+    qtbot.keyClick(model_menu, Qt.Key.Key_2)
+    assert window.model_combo.currentData() == "model-b"
+
+    menu = window._build_request_settings_menu()
+    effort_menu = menu.actions()[1].menu()
+    assert isinstance(effort_menu, NumberedChoiceMenu)
+    effort_menu.show()
+    qtbot.keyClick(effort_menu, Qt.Key.Key_2)
+    assert window.effort_combo.currentData() == "high"
+
+    menu = window._build_request_settings_menu()
+    model_menu = menu.actions()[0].menu()
+    assert isinstance(model_menu, NumberedChoiceMenu)
+    menu.show()
+    qtbot.keyClick(menu, Qt.Key.Key_1)
+    assert model_menu.isVisible() is True
+    qtbot.keyClick(model_menu, Qt.Key.Key_1)
+    assert menu.isVisible() is False
+
+
+def test_ctrl_i_opens_request_settings_from_composer(qtbot, monkeypatch) -> None:
+    window, service = make_window(qtbot)
+    opened: list[bool] = []
+    monkeypatch.setattr(
+        NumberedChoiceMenu,
+        "exec",
+        lambda _menu, *_args: opened.append(True),
+    )
+    window.show()
+    window.composer.setFocus()
+
+    qtbot.keyClick(
+        window.composer,
+        Qt.Key.Key_I,
+        modifier=Qt.KeyboardModifier.ControlModifier,
+    )
+
+    assert opened == [True]
+    assert service.sent == []
+
+
+def test_ctrl_t_toggles_latest_activity_group(qtbot) -> None:
+    window, _service = make_window(qtbot)
+
+    first = window._activity("first", "Первая команда", "first output")
+    group = window._latest_activity_group
+    assert group is not None
+    assert group.header.isChecked() is False
+    assert group.items_container.isHidden() is True
+    assert first.toggle.isChecked() is False
+
+    second = window._activity("second", "Вторая команда", "second output")
+    assert first.toggle.isChecked() is False
+    assert second.toggle.isChecked() is False
+
+    window.show()
+    window.composer.setFocus()
+    qtbot.keyClick(
+        window.composer,
+        Qt.Key.Key_T,
+        modifier=Qt.KeyboardModifier.ControlModifier,
+    )
+    assert group.header.isChecked() is True
+    assert group.items_container.isHidden() is False
+    assert second.toggle.isChecked() is True
+    assert second.body.isHidden() is False
+    qtbot.keyClick(
+        window.composer,
+        Qt.Key.Key_T,
+        modifier=Qt.KeyboardModifier.ControlModifier,
+    )
+    assert group.header.isChecked() is False
+    assert group.items_container.isHidden() is True
+    assert second.toggle.isChecked() is False
+    assert second.body.isHidden() is True
+
+
+def test_open_activity_group_follows_newest_action(qtbot) -> None:
+    window, _service = make_window(qtbot)
+    first = window._activity("first", "Первая команда", "first output")
+
+    window._toggle_latest_activity()
+    second = window._activity("second", "Вторая команда", "second output")
+    group = window._latest_activity_group
+
+    assert group is not None and group.header.isChecked() is True
+    assert first.toggle.isChecked() is False
+    assert second.toggle.isChecked() is True
+
+
+def test_ctrl_t_hint_is_only_visible_on_latest_activity_group(qtbot) -> None:
+    window, _service = make_window(qtbot)
+
+    window._activity("first", "Первая команда", "first output")
+    first_group = window._latest_activity_group
+    assert first_group is not None
+    assert first_group.header.shortcut_label.isHidden() is False
+
+    window._agent_delta("answer", "Готово")
+    window._activity("second", "Вторая команда", "second output")
+    second_group = window._latest_activity_group
+
+    assert second_group is not None and second_group is not first_group
+    assert first_group.header.shortcut_label.isHidden() is True
+    assert second_group.header.shortcut_label.isHidden() is False
+
+
+def test_ctrl_m_opens_access_menu_from_composer(qtbot, monkeypatch) -> None:
+    window, service = make_window(qtbot)
+    opened: list[bool] = []
+    monkeypatch.setattr(
+        NumberedChoiceMenu,
+        "exec",
+        lambda _menu, *_args: opened.append(True),
+    )
+    window.show()
+    window.composer.setFocus()
+
+    qtbot.keyClick(
+        window.composer,
+        Qt.Key.Key_M,
+        modifier=Qt.KeyboardModifier.ControlModifier,
+    )
+
+    assert opened == [True]
+    assert service.sent == []
+
+
+def test_escape_stop_requires_confirmation(qtbot, monkeypatch) -> None:
+    window, service = make_window(qtbot)
+    interrupted: list[bool] = []
+    service.interrupt = lambda: interrupted.append(True)  # type: ignore[method-assign]
+    window._turn_state("inProgress")
+    assert window.stop_shortcut.isEnabled() is True
+
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.No,
+    )
+    window.stop_shortcut.activated.emit()
+    assert interrupted == []
+
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+    window.stop_shortcut.activated.emit()
+    assert interrupted == [True]
 
 
 def test_sidebar_auto_hides_on_narrow_window_but_respects_manual_choice(qtbot) -> None:
@@ -710,7 +941,11 @@ def test_unknown_slash_and_absolute_path_are_regular_prompts(qtbot) -> None:
     window, service = make_window(qtbot)
     window.composer.setPlainText("/unknown")
     assert window.slash_panel.isHidden() is True
-    qtbot.keyClick(window.composer, Qt.Key.Key_Return)
+    qtbot.keyClick(
+        window.composer,
+        Qt.Key.Key_Return,
+        modifier=Qt.KeyboardModifier.ShiftModifier,
+    )
     assert "\n" in window.composer.toPlainText()
 
     window.composer.setPlainText("/unknown argument")

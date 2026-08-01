@@ -245,12 +245,19 @@ class Composer(QTextEdit):
     slashComplete = Signal()
     slashActivate = Signal()
     slashDismiss = Signal()
+    newChatRequested = Signal()
+    accessModeRequested = Signal()
+    attachmentRequested = Signal()
+    requestSettingsRequested = Signal()
+    latestActivityRequested = Signal()
+    stopRequested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
         self.setAcceptDrops(True)
         self.setObjectName("composer")
         self.setPlaceholderText("Попросите Codex изменить код, найти ошибку или объяснить проект…")
+        self.setToolTip("Enter — отправить · Shift+Enter — новая строка")
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -295,7 +302,28 @@ class Composer(QTextEdit):
             ):
                 self.slashActivate.emit()
                 return
-        if event.key() in {Qt.Key.Key_Return, Qt.Key.Key_Enter} and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+        if event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+            shortcut_signals = {
+                Qt.Key.Key_K: self.newChatRequested,
+                Qt.Key.Key_M: self.accessModeRequested,
+                Qt.Key.Key_O: self.attachmentRequested,
+                Qt.Key.Key_I: self.requestSettingsRequested,
+                Qt.Key.Key_T: self.latestActivityRequested,
+            }
+            signal = shortcut_signals.get(event.key())
+            if signal is not None:
+                signal.emit()
+                return
+        if (
+            event.key() == Qt.Key.Key_Escape
+            and event.modifiers() == Qt.KeyboardModifier.NoModifier
+        ):
+            self.stopRequested.emit()
+            return
+        if (
+            event.key() in {Qt.Key.Key_Return, Qt.Key.Key_Enter}
+            and event.modifiers() == Qt.KeyboardModifier.NoModifier
+        ):
             self.sendRequested.emit()
             return
         super().keyPressEvent(event)
@@ -391,6 +419,118 @@ class SlashCommandPanel(QFrame):
     def _item_clicked(self, item: QListWidgetItem) -> None:
         if bool(item.data(int(Qt.ItemDataRole.UserRole) + 1)):
             self.commandActivated.emit(str(item.data(Qt.ItemDataRole.UserRole)))
+
+
+class NumberedChoiceMenu(QMenu):
+    """A menu whose visible actions can be selected with number keys."""
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        text = event.text()
+        if len(text) == 1 and text in "123456789":
+            actions = [
+                action
+                for action in self.actions()
+                if action.isVisible() and not action.isSeparator()
+            ]
+            index = int(text) - 1
+            if index < len(actions) and actions[index].isEnabled():
+                action = actions[index]
+                submenu = action.menu()
+                if submenu is not None:
+                    self.setActiveAction(action)
+                    action_rect = self.actionGeometry(action)
+                    submenu.popup(
+                        self.mapToGlobal(
+                            QPoint(action_rect.right(), action_rect.top())
+                        )
+                    )
+                    submenu.setFocus()
+                else:
+                    action.trigger()
+                    menu: QWidget | None = self
+                    while isinstance(menu, QMenu):
+                        parent = menu.parentWidget()
+                        menu.close()
+                        menu = parent
+                return
+        super().keyPressEvent(event)
+
+
+class ShortcutPushButton(QPushButton):
+    def __init__(
+        self,
+        text: str,
+        shortcut_text: str,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(text, parent)
+        self.shortcut_label = QLabel(shortcut_text, self)
+        self.shortcut_label.setObjectName("inlineShortcutLabel")
+        self.shortcut_label.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents
+        )
+        self.shortcut_label.adjustSize()
+        self.shortcut_label.raise_()
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self.shortcut_label.adjustSize()
+        self.shortcut_label.move(
+            max(0, self.width() - self.shortcut_label.width() - 10),
+            max(0, (self.height() - self.shortcut_label.height()) // 2),
+        )
+        self.shortcut_label.raise_()
+
+
+class ShortcutToolButton(QToolButton):
+    def __init__(
+        self,
+        shortcut_text: str,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.shortcut_label = QLabel(shortcut_text, self)
+        self.shortcut_label.setObjectName("inlineShortcutLabel")
+        self.shortcut_label.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents
+        )
+        self.shortcut_label.adjustSize()
+        self.shortcut_label.raise_()
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self.shortcut_label.adjustSize()
+        self.shortcut_label.move(
+            max(0, self.width() - self.shortcut_label.width() - 10),
+            max(0, (self.height() - self.shortcut_label.height()) // 2),
+        )
+        self.shortcut_label.raise_()
+
+
+class ShortcutComboBox(QComboBox):
+    popupRequested = Signal()
+
+    def __init__(self, shortcut_text: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.shortcut_label = QLabel(shortcut_text, self)
+        self.shortcut_label.setObjectName("inlineShortcutLabel")
+        self.shortcut_label.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents
+        )
+        self.shortcut_label.adjustSize()
+        self.shortcut_label.raise_()
+
+    def showPopup(self) -> None:
+        self.popupRequested.emit()
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self.shortcut_label.adjustSize()
+        self.shortcut_label.move(
+            max(0, self.width() - self.shortcut_label.width() - 25),
+            max(0, (self.height() - self.shortcut_label.height()) // 2),
+        )
+        self.shortcut_label.raise_()
 
 
 class MessageCard(QFrame):
@@ -600,7 +740,7 @@ class ActivityGroupCard(QFrame):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        self.header = QToolButton()
+        self.header = ShortcutToolButton("Ctrl+T")
         self.header.setText("ДЕЙСТВИЯ")
         self.header.setObjectName("activityGroupTitle")
         self.header.setCheckable(True)
@@ -929,6 +1069,8 @@ class MainWindow(QMainWindow):
         self.cards: dict[str, MessageCard | ActivityCard] = {}
         self._execution_plan_cards: dict[str, ExecutionPlanCard] = {}
         self._last_activity_group: ActivityGroupCard | None = None
+        self._latest_activity_card: ActivityCard | None = None
+        self._latest_activity_group: ActivityGroupCard | None = None
         self._approval_queue: list[ApprovalPrompt] = []
         self._current_approval: ApprovalPrompt | None = None
         self._user_input_queue: list[tuple[object, dict[str, Any]]] = []
@@ -975,6 +1117,23 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.main_splitter)
         self.sidebar_shortcut = QShortcut(QKeySequence("Ctrl+B"), self)
         self.sidebar_shortcut.activated.connect(self._toggle_sidebar)
+        self.new_chat_shortcut = QShortcut(QKeySequence("Ctrl+K"), self)
+        self.new_chat_shortcut.activated.connect(self._shortcut_new_chat)
+        self.access_mode_shortcut = QShortcut(QKeySequence("Ctrl+M"), self)
+        self.access_mode_shortcut.activated.connect(self._show_access_mode_menu)
+        self.attach_file_shortcut = QShortcut(QKeySequence("Ctrl+O"), self)
+        self.attach_file_shortcut.activated.connect(self._shortcut_choose_attachments)
+        self.request_settings_shortcut = QShortcut(QKeySequence("Ctrl+I"), self)
+        self.request_settings_shortcut.activated.connect(
+            self._show_request_settings_menu
+        )
+        self.latest_activity_shortcut = QShortcut(QKeySequence("Ctrl+T"), self)
+        self.latest_activity_shortcut.activated.connect(
+            self._toggle_latest_activity
+        )
+        self.stop_shortcut = QShortcut(QKeySequence("Esc"), self)
+        self.stop_shortcut.setEnabled(False)
+        self.stop_shortcut.activated.connect(self._confirm_interrupt)
         self.statusBar().showMessage("Запуск AI-агента…")
 
     def _build_notifications(self) -> None:
@@ -1015,6 +1174,52 @@ class MainWindow(QMainWindow):
         self._set_sidebar_visible(not visible)
         self.settings.set("sidebar_hidden", self._sidebar_user_hidden)
 
+    def _shortcut_new_chat(self) -> None:
+        if not self.new_chat_button.isEnabled():
+            self._show_notice(
+                "Новый чат нельзя открыть во время активного хода или обработки очереди.",
+                "warning",
+            )
+            return
+        self._new_chat()
+
+    def _shortcut_choose_attachments(self) -> None:
+        if not self.attach_button.isEnabled():
+            self._show_notice(
+                self.attach_button.toolTip() or "Добавление файлов сейчас недоступно.",
+                "warning",
+            )
+            return
+        self._choose_attachments()
+
+    def _toggle_latest_activity(self) -> None:
+        group = self._latest_activity_group
+        card = self._latest_activity_card
+        if group is None or card is None:
+            return
+        expanded = group.header.isChecked() and card.toggle.isChecked()
+        group.header.setChecked(not expanded)
+        card.toggle.setChecked(not expanded)
+        self.scroll.ensureWidgetVisible(group, 0, 24)
+
+    def _confirm_interrupt(self) -> None:
+        if not self._turn_active:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Остановить генерацию?",
+            "Текущий ответ будет прерван. Сообщения в очереди останутся на месте.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        cancel_run = getattr(self.service, "cancel_run", None)
+        if callable(cancel_run):
+            cancel_run()
+        else:
+            self.service.interrupt()
+
     def _set_sidebar_visible(self, visible: bool) -> None:
         self.sidebar_panel.setVisible(visible)
         if visible:
@@ -1050,11 +1255,13 @@ class MainWindow(QMainWindow):
         brand_row.addStretch(1)
         layout.addLayout(brand_row)
 
-        self.new_chat_button = QPushButton("Новый чат")
+        self.new_chat_button = ShortcutPushButton("Новый чат", "Ctrl+K")
         self.new_chat_button.setObjectName("newChatButton")
         self.new_chat_button.setIcon(asset_icon("new-chat.svg"))
         self.new_chat_button.setAccessibleName("Создать новый чат")
+        self.new_chat_button.setToolTip("Создать новый чат · Ctrl+K")
         self.new_chat_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.new_chat_shortcut_label = self.new_chat_button.shortcut_label
         self.thread_search = QLineEdit()
         self.thread_search.setObjectName("threadSearch")
         self.thread_search.setPlaceholderText("Поиск по чатам…")
@@ -1093,9 +1300,13 @@ class MainWindow(QMainWindow):
         self.sidebar_toggle = QToolButton()
         self.sidebar_toggle.setObjectName("sidebarToggle")
         self.sidebar_toggle.setIcon(asset_icon("sidebar.svg"))
+        self.sidebar_toggle.setText("Ctrl+B")
+        self.sidebar_toggle.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+        )
         self.sidebar_toggle.setToolTip("Скрыть или показать боковую панель · Ctrl+B")
         self.sidebar_toggle.setAccessibleName("Переключить боковую панель")
-        self.sidebar_toggle.setFixedSize(32, 32)
+        self.sidebar_toggle.setFixedSize(76, 32)
         self.sidebar_toggle.clicked.connect(self._toggle_sidebar)
         topbar_layout.addWidget(self.sidebar_toggle)
         titles = QVBoxLayout()
@@ -1128,9 +1339,12 @@ class MainWindow(QMainWindow):
         self.effort_combo.setObjectName("optionCombo")
         self.effort_combo.setAccessibleName("Глубина рассуждений")
         self.effort_combo.setVisible(False)
-        self.access_combo = QComboBox()
+        self.access_combo = ShortcutComboBox("Ctrl+M")
         self.access_combo.setObjectName("accessCombo")
         self.access_combo.setAccessibleName("Режим агента")
+        self.access_combo.setMinimumWidth(180)
+        self.access_shortcut_label = self.access_combo.shortcut_label
+        self.access_combo.popupRequested.connect(self._show_access_mode_menu)
 
         self.scroll = QScrollArea()
         self.scroll.setObjectName("conversationScroll")
@@ -1329,21 +1543,27 @@ class MainWindow(QMainWindow):
         self.settings_button = QToolButton()
         self.settings_button.setObjectName("settingsButton")
         self.settings_button.setIcon(asset_icon("settings.svg"))
-        self.settings_button.setToolTip("Выбрать модель и усилие рассуждений")
+        self.settings_button.setText("Ctrl+I")
+        self.settings_button.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+        )
+        self.settings_button.setToolTip(
+            "Выбрать модель и усилие рассуждений · Ctrl+I"
+        )
         self.settings_button.setAccessibleName("Настройки запроса")
-        self.settings_button.setFixedSize(32, 32)
+        self.settings_button.setFixedSize(76, 32)
         controls_row.addWidget(self.settings_button)
 
         self.send_button = QPushButton()
         self.send_button.setObjectName("sendButton")
         self.send_button.setIcon(asset_icon("send.svg"))
-        self.send_button.setToolTip("Отправить · Ctrl+Enter")
+        self.send_button.setToolTip("Отправить · Enter (Shift+Enter — новая строка)")
         self.send_button.setAccessibleName("Отправить сообщение")
         self.send_button.setFixedSize(34, 34)
         self.stop_button = QPushButton()
         self.stop_button.setObjectName("stopButton")
         self.stop_button.setIcon(asset_icon("stop.svg"))
-        self.stop_button.setToolTip("Остановить выполнение")
+        self.stop_button.setToolTip("Остановить выполнение · Esc")
         self.stop_button.setAccessibleName("Остановить выполнение")
         self.stop_button.setFixedSize(34, 34)
         self.stop_button.setVisible(False)
@@ -1410,12 +1630,19 @@ class MainWindow(QMainWindow):
         self.composer.slashComplete.connect(self._complete_slash_command)
         self.composer.slashActivate.connect(self.slash_panel.activate_selected)
         self.composer.slashDismiss.connect(self._dismiss_slash_panel)
+        self.composer.newChatRequested.connect(self._shortcut_new_chat)
+        self.composer.accessModeRequested.connect(self._show_access_mode_menu)
+        self.composer.attachmentRequested.connect(self._shortcut_choose_attachments)
+        self.composer.requestSettingsRequested.connect(
+            self._show_request_settings_menu
+        )
+        self.composer.latestActivityRequested.connect(
+            self._toggle_latest_activity
+        )
+        self.composer.stopRequested.connect(self._confirm_interrupt)
         self.slash_panel.commandActivated.connect(self._activate_slash_command)
         self.send_button.clicked.connect(self._send)
-        cancel_run = getattr(self.service, "cancel_run", None)
-        self.stop_button.clicked.connect(
-            cancel_run if callable(cancel_run) else self.service.interrupt
-        )
+        self.stop_button.clicked.connect(self._confirm_interrupt)
         self.queue_resume_button.clicked.connect(self._resume_queue)
         self.queue_clear_button.clicked.connect(self._clear_message_queue)
         self.model_combo.currentIndexChanged.connect(self._model_changed)
@@ -1639,7 +1866,9 @@ class MainWindow(QMainWindow):
                 reason if settings_supported and reason else f"Настройки модели не поддерживаются агентом {name}"
             )
         else:
-            self.settings_button.setToolTip("Настройки текущего запроса")
+            self.settings_button.setToolTip(
+                "Настройки текущего запроса · Ctrl+I"
+            )
         access_state = self._feature_state(FeatureId.ACCESS_MODES, capabilities.access_modes)
         has_modes = any(
             str(self.access_combo.itemData(index) or "")
@@ -1648,17 +1877,25 @@ class MainWindow(QMainWindow):
         self.access_combo.setEnabled(
             access_state.enabled and has_modes and self._editing_queued_message is None
         )
-        self.access_combo.setToolTip(
-            self.access_combo.toolTip() or "Режим агента для следующего запроса"
-            if access_state.enabled and has_modes
-            else access_state.reason or f"{name} не объявил доступные режимы"
-        )
+        self.access_shortcut_label.setEnabled(self.access_combo.isEnabled())
+        self._refresh_access_shortcut_style()
+        if access_state.enabled and has_modes:
+            access_tip = self.access_combo.toolTip() or "Режим агента для следующего запроса"
+            if "Ctrl+M" not in access_tip:
+                access_tip += "\nCtrl+M — выбрать режим"
+            self.access_combo.setToolTip(access_tip)
+        else:
+            self.access_combo.setToolTip(
+                access_state.reason or f"{name} не объявил доступные режимы"
+            )
         attachment_state = self._feature_state(FeatureId.INPUT_FILES, capabilities.attachments)
         self.attach_button.setEnabled(
             attachment_state.enabled and self._editing_queued_message is None
         )
         self.attach_button.setToolTip(
-            "Добавить вложение" if attachment_state.enabled else attachment_state.reason
+            "Добавить вложение · Ctrl+O"
+            if attachment_state.enabled
+            else attachment_state.reason
         )
         quota_state = self._feature_state(FeatureId.USAGE_QUOTA, capabilities.rate_limits)
         self.weekly_limit.setEnabled(quota_state.enabled)
@@ -2020,8 +2257,8 @@ class MainWindow(QMainWindow):
         if callable(setter):
             setter(option.id, value)
 
-    def _build_request_settings_menu(self) -> QMenu:
-        menu = QMenu(self)
+    def _build_request_settings_menu(self) -> NumberedChoiceMenu:
+        menu = NumberedChoiceMenu(self)
         menu.setObjectName("requestSettingsMenu")
         arrow_path = str(
             files("codex_gui").joinpath("assets", "chevron-right.svg")
@@ -2044,56 +2281,69 @@ class MainWindow(QMainWindow):
         )
 
         selected_model = self._selected_model()
-        model_menu = QMenu(
-            selected_model.display_name if selected_model else "Модель",
+        model_title = selected_model.display_name if selected_model else "Модель"
+        model_menu = NumberedChoiceMenu(
+            f"1   {model_title}",
             menu,
         )
         model_menu.setObjectName("modelSettingsMenu")
         menu.addMenu(model_menu)
         for index, model in enumerate(self.models):
-            action = model_menu.addAction(model.display_name)
+            prefix = f"{index + 1}   " if index < 9 else ""
+            action = model_menu.addAction(prefix + model.display_name)
             action.setCheckable(True)
             action.setChecked(index == self.model_combo.currentIndex())
             action.triggered.connect(
                 lambda _checked=False, target=index: self.model_combo.setCurrentIndex(target)
             )
         if not self.models:
-            unavailable = model_menu.addAction("Модели ещё загружаются…")
+            unavailable = model_menu.addAction("1   Модели ещё загружаются…")
             unavailable.setEnabled(False)
 
         current_effort = self.effort_combo.currentData()
-        effort_menu = QMenu(effort_title(current_effort), menu)
+        effort_menu = NumberedChoiceMenu(
+            f"2   {effort_title(current_effort)}",
+            menu,
+        )
         effort_menu.setObjectName("effortSettingsMenu")
         menu.addMenu(effort_menu)
         for index in range(self.effort_combo.count()):
             value = self.effort_combo.itemData(index)
-            action = effort_menu.addAction(effort_title(value))
+            prefix = f"{index + 1}   " if index < 9 else ""
+            action = effort_menu.addAction(prefix + effort_title(value))
             action.setCheckable(True)
             action.setChecked(index == self.effort_combo.currentIndex())
             action.triggered.connect(
                 lambda _checked=False, target=index: self.effort_combo.setCurrentIndex(target)
             )
         if not self.effort_combo.count():
-            unavailable = effort_menu.addAction("Недоступно для текущей модели")
+            unavailable = effort_menu.addAction(
+                "1   Недоступно для текущей модели"
+            )
             unavailable.setEnabled(False)
         generic_menus: list[QMenu] = []
         for option in self.agent_config_options:
             if option.category in {"model", "thought_level", "mode"}:
                 continue
-            option_menu = QMenu(option.name, menu)
+            menu_number = len(menu.actions()) + 1
+            title_prefix = f"{menu_number}   " if menu_number <= 9 else ""
+            option_menu = NumberedChoiceMenu(title_prefix + option.name, menu)
             menu.addMenu(option_menu)
             generic_menus.append(option_menu)
             if option.kind == "boolean":
-                for label, value in (("Включено", True), ("Выключено", False)):
-                    action = option_menu.addAction(label)
+                for index, (label, value) in enumerate(
+                    (("Включено", True), ("Выключено", False))
+                ):
+                    action = option_menu.addAction(f"{index + 1}   {label}")
                     action.setCheckable(True)
                     action.setChecked(option.current_value is value)
                     action.triggered.connect(
                         lambda _checked=False, target=option, selected=value: self._set_config_value(target, selected)
                     )
             else:
-                for value in option.values:
-                    action = option_menu.addAction(value.label)
+                for index, value in enumerate(option.values):
+                    prefix = f"{index + 1}   " if index < 9 else ""
+                    action = option_menu.addAction(prefix + value.label)
                     action.setCheckable(True)
                     action.setChecked(str(option.current_value) == value.value)
                     action.setToolTip(value.description)
@@ -2106,6 +2356,13 @@ class MainWindow(QMainWindow):
         return menu
 
     def _show_request_settings_menu(self) -> None:
+        if not self.settings_button.isEnabled():
+            self._show_notice(
+                self.settings_button.toolTip()
+                or "Настройки запроса сейчас недоступны.",
+                "warning",
+            )
+            return
         menu = self._build_request_settings_menu()
         menu.ensurePolished()
         size = menu.sizeHint()
@@ -2158,6 +2415,44 @@ class MainWindow(QMainWindow):
             if callable(setter):
                 setter(option.id, str(self.effort_combo.currentData()))
         self._note_next_request_setting()
+
+    def _build_access_mode_menu(self) -> NumberedChoiceMenu:
+        menu = NumberedChoiceMenu(self)
+        menu.setObjectName("accessModeShortcutMenu")
+        for index in range(min(9, self.access_combo.count())):
+            mode_id = str(self.access_combo.itemData(index) or "")
+            if not mode_id:
+                continue
+            action = menu.addAction(
+                f"{len(menu.actions()) + 1}   {self.access_combo.itemText(index)}"
+            )
+            action.setCheckable(True)
+            action.setChecked(index == self.access_combo.currentIndex())
+            description = self.access_combo.itemData(index, Qt.ItemDataRole.ToolTipRole)
+            if description:
+                action.setToolTip(str(description))
+            action.triggered.connect(
+                lambda _checked=False, target=index: self.access_combo.setCurrentIndex(target)
+            )
+        return menu
+
+    def _show_access_mode_menu(self) -> None:
+        if not self.access_combo.isEnabled():
+            self._show_notice(
+                self.access_combo.toolTip() or "Смена режима сейчас недоступна.",
+                "warning",
+            )
+            return
+        menu = self._build_access_mode_menu()
+        if not menu.actions():
+            self._show_notice("Текущий агент не предоставил режимы работы.", "warning")
+            return
+        menu.ensurePolished()
+        size = menu.sizeHint()
+        position = self.access_combo.mapToGlobal(
+            QPoint(0, -size.height() - 6)
+        )
+        menu.exec(position)
 
     def _access_changed(self, _index: int) -> None:
         selected = str(self.access_combo.currentData() or "")
@@ -2218,11 +2513,28 @@ class MainWindow(QMainWindow):
         tone = descriptor.tone if descriptor is not None else "neutral"
         description = descriptor.description if descriptor is not None else ""
         suffix = "\nПрименится к следующему сообщению" if self._turn_active else ""
-        self.access_combo.setToolTip(description + suffix)
+        self.access_combo.setToolTip(description + suffix + "\nCtrl+M — выбрать режим")
         self.access_combo.setProperty("mode", tone)
         self.access_combo.setProperty("nextTurn", self._turn_active)
+        self.access_shortcut_label.setProperty("accessTone", tone)
         self.access_combo.style().unpolish(self.access_combo)
         self.access_combo.style().polish(self.access_combo)
+        self._refresh_access_shortcut_style()
+
+    def _refresh_access_shortcut_style(self) -> None:
+        tone = str(self.access_shortcut_label.property("accessTone") or "neutral")
+        color = {
+            "safe": "#b8d8c2",
+            "workspace": "#d4ddd7",
+            "neutral": "#d2d5d2",
+            "plan": "#d2c9eb",
+            "danger": "#efb8b2",
+        }.get(tone, "#d2d5d2")
+        if not self.access_shortcut_label.isEnabled():
+            color = "#606662"
+        self.access_shortcut_label.setStyleSheet(
+            f"color: {color}; font-size: 9px;"
+        )
 
     def _note_next_request_setting(self) -> None:
         if self._turn_active:
@@ -2705,11 +3017,13 @@ class MainWindow(QMainWindow):
             else ""
         )
         self.queue_edit_detail.setText(
-            f"Сообщение №{queue_index}{attachment_note} · Ctrl+Enter — сохранить"
+            f"Сообщение №{queue_index}{attachment_note} · Enter — сохранить · Shift+Enter — новая строка"
         )
         self.queue_edit_banner.setVisible(True)
         self.attach_button.setEnabled(False)
         self.access_combo.setEnabled(False)
+        self.access_shortcut_label.setEnabled(False)
+        self._refresh_access_shortcut_style()
         self.settings_button.setEnabled(False)
         composer_panel = self.composer.parentWidget()
         if composer_panel is not None:
@@ -2744,6 +3058,8 @@ class MainWindow(QMainWindow):
         self._render_attachments()
         self.attach_button.setEnabled(True)
         self.access_combo.setEnabled(True)
+        self.access_shortcut_label.setEnabled(True)
+        self._refresh_access_shortcut_style()
         self.settings_button.setEnabled(True)
         composer_panel = self.composer.parentWidget()
         if composer_panel is not None:
@@ -2858,6 +3174,7 @@ class MainWindow(QMainWindow):
         self.queue_panel.setVisible(bool(count))
         navigation_enabled = not self._turn_active and not self._queue_action_pending
         self.new_chat_button.setEnabled(navigation_enabled)
+        self.new_chat_shortcut_label.setEnabled(navigation_enabled)
         self.thread_list.setEnabled(navigation_enabled)
         self.project_combo.setEnabled(navigation_enabled)
         self.agent_combo.setEnabled(navigation_enabled and not bool(count))
@@ -2893,6 +3210,8 @@ class MainWindow(QMainWindow):
         self.cards.clear()
         self._execution_plan_cards.clear()
         self._last_activity_group = None
+        self._latest_activity_card = None
+        self._latest_activity_group = None
         self._auto_follow = True
         if hasattr(self, "scroll_down_button"):
             self.scroll_down_button.setVisible(False)
@@ -3099,17 +3418,38 @@ class MainWindow(QMainWindow):
     def _activity(self, item_id: str, title: str, content: str) -> ActivityCard:
         card = self.cards.get(item_id)
         if not isinstance(card, ActivityCard):
+            previous_card = self._latest_activity_card
+            previous_group = self._latest_activity_group
+            follow_latest = bool(
+                previous_card is not None
+                and previous_group is not None
+                and previous_group.header.isChecked()
+                and previous_card.toggle.isChecked()
+            )
             card = ActivityCard(title, content)
             self.cards[item_id] = card
             self._remove_empty_hint()
             if self._last_activity_group is None:
+                if previous_group is not None:
+                    previous_group.header.shortcut_label.setVisible(
+                        False
+                    )
                 self._last_activity_group = ActivityGroupCard()
+                self._latest_activity_group = self._last_activity_group
                 self.timeline_layout.insertWidget(
                     self.timeline_layout.count() - 1,
                     self._last_activity_group,
                 )
                 self._move_thinking_to_bottom()
             self._last_activity_group.add_activity(card)
+            self._latest_activity_card = card
+            if follow_latest:
+                if previous_card is not None:
+                    previous_card.toggle.setChecked(False)
+                if previous_group is not None and previous_group is not self._last_activity_group:
+                    previous_group.header.setChecked(False)
+                self._last_activity_group.header.setChecked(True)
+                card.toggle.setChecked(True)
         else:
             card.toggle.setText(title)
             card.set_content(content)
@@ -3184,8 +3524,10 @@ class MainWindow(QMainWindow):
         self.send_button.setVisible(True)
         self._refresh_send_button()
         self.stop_button.setVisible(active)
+        self.stop_shortcut.setEnabled(active)
         self.composer.setEnabled(True)
         self.new_chat_button.setEnabled(not active)
+        self.new_chat_shortcut_label.setEnabled(not active)
         self.thread_list.setEnabled(not active)
         self.project_combo.setEnabled(not active)
         self.agent_combo.setEnabled(not active and not bool(self._message_queue))
@@ -3228,7 +3570,7 @@ class MainWindow(QMainWindow):
         if self._editing_queued_message is not None:
             self.send_button.setIcon(asset_icon("save.svg"))
             self.send_button.setToolTip(
-                "Сохранить изменения сообщения в очереди · Ctrl+Enter"
+                "Сохранить изменения · Enter (Shift+Enter — новая строка)"
             )
             self.send_button.setAccessibleName(
                 "Сохранить изменения сообщения в очереди"
@@ -3238,9 +3580,9 @@ class MainWindow(QMainWindow):
             asset_icon("queue.svg" if self._turn_active else "send.svg")
         )
         self.send_button.setToolTip(
-            "Добавить сообщение в очередь · Ctrl+Enter"
+            "Добавить сообщение в очередь · Enter (Shift+Enter — новая строка)"
             if self._turn_active
-            else "Отправить · Ctrl+Enter"
+            else "Отправить · Enter (Shift+Enter — новая строка)"
         )
         self.send_button.setAccessibleName(
             "Добавить сообщение в очередь"

@@ -7,9 +7,9 @@
 ![Qt](https://img.shields.io/badge/UI-PySide6-41CD52?logo=qt&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
-An unofficial desktop client for local AI coding agents, built with Python and
-PySide6. It bundles a native Codex CLI driver and a generic ACP v1 client for
-agents that support the local stdio transport.
+An unofficial multi-agent desktop client for local AI coding agents, built with
+Python and PySide6. You can use the built-in Codex CLI integration or connect
+other agents through the stable ACP v1 protocol over local stdio.
 
 Codex Kostyl provides one interface for local projects, saved conversations,
 streaming responses, approvals, and attachments. For Codex it talks directly to
@@ -23,10 +23,11 @@ capabilities determine which UI controls are available.
 
 ## Why this project exists
 
-Codex CLI already provides a powerful terminal workflow. Codex Kostyl is intended
-for Linux and macOS users who prefer a native desktop interface for longer conversations,
-visual review of agent activity, permission prompts, file attachments, and
-switching between multiple local projects.
+CLI coding agents provide powerful terminal workflows. Codex Kostyl is intended
+for Linux and macOS users who prefer one native desktop interface for longer
+conversations, visual review of agent activity, permission prompts, file
+attachments, switching between local projects, and working with more than one
+agent.
 
 The application does not implement its own agent backend. The selected CLI agent
 remains responsible for authentication, model access, conversation storage, tool
@@ -35,20 +36,28 @@ execution, and sandbox enforcement.
 ## Features
 
 - Local projects backed by working directories.
-- Create, open, continue, and fork saved Codex conversations.
+- Agent selector for switching between the built-in Codex integration and
+  configured ACP agents.
+- Create, open, continue, and fork conversations when supported by the selected
+  agent.
 - Streaming agent messages, reasoning, command output, plans, and file changes.
-- Dynamic model and reasoning-effort selection from Codex.
-- Read-only, workspace-write, full-access, and Plan Mode workflows.
+- Dynamic model, reasoning-effort, session-mode, and configuration controls
+  advertised by the selected agent.
+- Read-only, workspace-write, full-access, and Plan Mode workflows for Codex;
+  ACP agents expose their own supported modes.
 - Inline approval prompts for commands, file changes, network access, and
   additional filesystem permissions.
 - Local image and file attachments.
 - Message queue for follow-up prompts while a turn is still running.
-- Built-in Codex questions and plan-to-implementation confirmation.
-- Context-window and weekly usage indicators when reported by Codex.
+- Interactive questions and plan-to-implementation confirmation when supported
+  by the selected agent.
+- Context-window and usage indicators when reported by the selected agent,
+  including Codex weekly limits.
 - Markdown rendering with tables, links, and syntax-highlighted code blocks.
 - Copy and reuse previous messages in the composer.
 - Desktop notifications and active-turn interruption.
-- ChatGPT and OpenAI API-key authentication through Codex.
+- Agent-specific authentication flows, including ChatGPT and OpenAI API-key
+  authentication through Codex.
 - Multiple local ACP v1 agent profiles with separate executables and launch
   arguments.
 - Installable ACP integrations from the official ACP Registry or the latest
@@ -61,11 +70,13 @@ execution, and sandbox enforcement.
 
 - Linux or macOS.
 - Python 3.11 or newer.
-- For the built-in profile: Codex CLI 0.146.0 or newer in `PATH`, plus a
-  ChatGPT/Codex account or OpenAI API key.
-- For an ACP profile: a local executable that supports ACP v1 over stdio.
+- At least one supported local agent backend:
+  - Codex CLI 0.146.0 or newer in `PATH`, plus a ChatGPT/Codex account or OpenAI
+    API key; or
+  - a local executable that supports stable ACP v1 over stdio.
 
-Verify the local tools before installing:
+Verify Python before installing. If you plan to use the built-in Codex profile,
+also verify Codex CLI:
 
 ```bash
 python3 --version
@@ -95,10 +106,24 @@ registers the desktop entry and application icon.
 
 When the app opens:
 
-1. Sign in with ChatGPT or provide an OpenAI API key.
-2. Add or select a local working directory.
-3. Choose a model, reasoning effort, and access mode.
-4. Enter a task and send it to Codex.
+1. Select the built-in Codex profile or configure an ACP agent.
+2. Authenticate using the method offered by that agent, if required.
+3. Add or select a local working directory.
+4. Choose the available model, reasoning effort, and run/access mode options.
+5. Enter a task and send it to the selected agent.
+
+## Supported agents
+
+- **Codex CLI** is built in and communicates directly with `codex app-server`.
+- **ACP agents** can be added as local profiles when they support stable ACP v1
+  over stdio. Profiles may point to different executables and launch arguments.
+- **Installable integrations** can be discovered through the official ACP
+  Registry or installed from a compatible public GitHub Release.
+
+Feature availability is agent-dependent. The interface is built from each
+agent's advertised capabilities, so unsupported models, modes, authentication
+methods, session actions, attachments, or usage data are disabled with an
+explanation instead of being assumed to exist.
 
 ### Connecting an ACP agent
 
@@ -122,8 +147,8 @@ and run as isolated ACP subprocesses. See the
 
 ### macOS
 
-A packaged `.app`/DMG is not available yet. Install Codex CLI and run the client
-from a virtual environment:
+A packaged `.app`/DMG is not available yet. Install the CLI agent you want to
+use and run the client from a virtual environment:
 
 ```bash
 python3 -m venv .venv
@@ -132,8 +157,9 @@ python -m pip install -e .
 codex-kostyl
 ```
 
-If the GUI process cannot find Codex CLI in `PATH`, choose
-**Account → Set CLI executable…**.
+When using the built-in Codex profile, if the GUI process cannot find Codex CLI
+in `PATH`, choose **Account → Set CLI executable…**. ACP executable paths are
+configured separately for each agent profile.
 
 ### System-wide Linux installation
 
@@ -239,7 +265,9 @@ compatibility layer.
   by the selected agent.
 - `QSettings` stores project paths, the selected agent, per-agent executable and
   request settings, and window geometry.
-- API keys are passed to Codex and are not persisted by Codex Kostyl.
+- Authentication is handled by the selected agent or driver. OpenAI API keys
+  entered for Codex are forwarded to Codex and are not persisted by Codex
+  Kostyl.
 - Attachments are referenced by absolute local path and are not copied. Moving
   or deleting a source file makes the old attachment path unavailable.
 - The rotating diagnostic log contains lifecycle and protocol errors, not prompt
@@ -247,12 +275,16 @@ compatibility layer.
 
 To keep the interface responsive, the UI renders at most the latest 40 turns and
 300 items of an opened conversation. Very long messages and command output may be
-visually shortened, while the original history remains managed by Codex.
+visually shortened, while the original history remains managed by the selected
+agent.
 
 ## Security model
 
-The default mode is `workspace-write`. Codex can write inside the selected
-working directory, while actions that require approval are displayed in the GUI.
+Access modes and their enforcement belong to the selected agent. The built-in
+Codex profile defaults to `workspace-write`; actions that require approval are
+displayed in the GUI. ACP agents provide their own modes and approval choices.
+
+For Codex, the available presets are:
 
 - **Read only** — filesystem changes are disabled.
 - **Workspace write** — writes are limited to the selected project directory.
@@ -270,11 +302,13 @@ queued or newly sent message, not to the turn already in progress.
 
 - macOS currently supports Python/venv execution without a packaged app bundle.
 - Native Windows is not supported yet.
-- Codex CLI must be installed locally and accessible to the launcher.
+- Codex CLI is required only for the built-in Codex profile. Each ACP profile
+  requires its configured executable to be installed locally and accessible.
 - The interface intentionally renders only a recent bounded portion of very
   large conversations.
 - Attachments depend on their original filesystem paths.
-- The project is still evolving alongside the Codex app-server protocol.
+- The project is still evolving alongside the Codex app-server and ACP
+  protocols; feature parity varies between agents.
 - ACP support currently targets stable v1 over local stdio only. Remote
   transports and draft ACP v2 are not supported yet.
 - The client does not yet advertise client-side ACP terminal, file-read, or
