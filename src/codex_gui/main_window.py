@@ -578,7 +578,7 @@ class MessageCard(QFrame):
             self.edit_button = QToolButton()
             self.edit_button.setObjectName("messageActionButton")
             self.edit_button.setIcon(asset_icon("edit.svg"))
-            self.edit_button.setToolTip("Перенести текст в поле ввода для редактирования")
+            self.edit_button.setToolTip("Редактировать сообщение")
             self.edit_button.setAccessibleName("Редактировать сообщение")
             self.edit_button.setFixedSize(27, 25)
             actions.addWidget(self.edit_button)
@@ -1079,6 +1079,11 @@ class MainWindow(QMainWindow):
         self._editing_queued_message: QueuedMessage | None = None
         self._queue_edit_draft_text = ""
         self._queue_edit_draft_attachments: list[Attachment] = []
+        self._editing_message_item_id = ""
+        self._editing_message_draft_text = ""
+        self._editing_message_draft_attachments: list[Attachment] = []
+        self._message_edit_pending = False
+        self._message_items: dict[str, dict[str, Any]] = {}
         self._queue_paused = False
         self._queue_action_pending = False
         self._turn_active = False
@@ -1484,6 +1489,33 @@ class MainWindow(QMainWindow):
         self.queue_edit_banner.setVisible(False)
         composer_panel_layout.addWidget(self.queue_edit_banner)
 
+        self.message_edit_banner = QFrame()
+        self.message_edit_banner.setObjectName("messageEditBanner")
+        message_edit_layout = QHBoxLayout(self.message_edit_banner)
+        message_edit_layout.setContentsMargins(11, 8, 8, 8)
+        message_edit_layout.setSpacing(9)
+        message_edit_icon = QLabel("✎")
+        message_edit_icon.setObjectName("messageEditIcon")
+        message_edit_layout.addWidget(message_edit_icon)
+        message_edit_text = QVBoxLayout()
+        message_edit_text.setSpacing(1)
+        self.message_edit_title = QLabel("РЕДАКТИРОВАНИЕ СООБЩЕНИЯ")
+        self.message_edit_title.setObjectName("messageEditTitle")
+        self.message_edit_detail = QLabel()
+        self.message_edit_detail.setObjectName("messageEditDetail")
+        message_edit_text.addWidget(self.message_edit_title)
+        message_edit_text.addWidget(self.message_edit_detail)
+        message_edit_layout.addLayout(message_edit_text, 1)
+        self.message_edit_cancel_button = QPushButton("Отменить")
+        self.message_edit_cancel_button.setObjectName("messageEditCancel")
+        self.message_edit_cancel_button.setToolTip(
+            "Отменить редактирование и вернуть предыдущий черновик"
+        )
+        self.message_edit_cancel_button.clicked.connect(self._cancel_message_edit)
+        message_edit_layout.addWidget(self.message_edit_cancel_button)
+        self.message_edit_banner.setVisible(False)
+        composer_panel_layout.addWidget(self.message_edit_banner)
+
         self.attachment_row = QHBoxLayout()
         self.attachment_row.addStretch(1)
         composer_panel_layout.addLayout(self.attachment_row)
@@ -1858,6 +1890,7 @@ class MainWindow(QMainWindow):
         settings_enabled = (
             (model_state.enabled or thought_state.enabled or bool(self.agent_config_options))
             and self._editing_queued_message is None
+            and not self._editing_message_item_id
         )
         self.settings_button.setEnabled(settings_enabled)
         if not self.settings_button.isEnabled():
@@ -1875,7 +1908,10 @@ class MainWindow(QMainWindow):
             for index in range(self.access_combo.count())
         )
         self.access_combo.setEnabled(
-            access_state.enabled and has_modes and self._editing_queued_message is None
+            access_state.enabled
+            and has_modes
+            and self._editing_queued_message is None
+            and not self._editing_message_item_id
         )
         self.access_shortcut_label.setEnabled(self.access_combo.isEnabled())
         self._refresh_access_shortcut_style()
@@ -1890,7 +1926,9 @@ class MainWindow(QMainWindow):
             )
         attachment_state = self._feature_state(FeatureId.INPUT_FILES, capabilities.attachments)
         self.attach_button.setEnabled(
-            attachment_state.enabled and self._editing_queued_message is None
+            attachment_state.enabled
+            and self._editing_queued_message is None
+            and not self._editing_message_item_id
         )
         self.attach_button.setToolTip(
             "Добавить вложение · Ctrl+O"
@@ -2734,6 +2772,11 @@ class MainWindow(QMainWindow):
         if self._editing_queued_message is not None:
             self._save_queue_edit()
             return
+        if self._editing_message_item_id:
+            if self._message_edit_pending:
+                return
+            self._save_message_edit()
+            return
         text = self.composer.toPlainText().strip()
         if not text and not self.attachments:
             return
@@ -2860,6 +2903,9 @@ class MainWindow(QMainWindow):
             self._message_queue.append(message)
             self._render_message_queue()
             return
+        if self._queue_paused:
+            self._queue_paused = False
+            self._render_message_queue()
         if not self.plan_confirmation_card.isHidden():
             self._dismiss_plan_confirmation(send_queued=False)
         self._dispatch_message(message)
@@ -2883,29 +2929,7 @@ class MainWindow(QMainWindow):
         self._active_collaboration_mode = message.collaboration_mode
         submit_prompt = getattr(self.service, "submit_prompt", None)
         if callable(submit_prompt):
-            config = dict(message.config)
-            option_by_category = {
-                option.category: option for option in self.agent_config_options
-            }
-            if message.model:
-                model_option = option_by_category.get("model")
-                config[model_option.id if model_option else "model"] = message.model
-            if message.effort:
-                thought_option = option_by_category.get("thought_level")
-                config[
-                    thought_option.id if thought_option else "thought_level"
-                ] = message.effort
-            submit_prompt(
-                AgentPrompt(
-                    text=message.text,
-                    attachments=tuple(message.attachments),
-                    working_directory=getattr(self.service, "current_project", ""),
-                    config=config,
-                    mode=message.collaboration_mode or "",
-                    access_mode=message.access_mode,
-                    run_mode_id=message.run_mode_id,
-                )
-            )
+            submit_prompt(self._agent_prompt(message))
         else:
             self.service.send_message(
                 message.text,
@@ -2916,6 +2940,29 @@ class MainWindow(QMainWindow):
                 message.collaboration_mode,
             )
         return True
+
+    def _agent_prompt(self, message: QueuedMessage) -> AgentPrompt:
+        config = dict(message.config)
+        option_by_category = {
+            option.category: option for option in self.agent_config_options
+        }
+        if message.model:
+            model_option = option_by_category.get("model")
+            config[model_option.id if model_option else "model"] = message.model
+        if message.effort:
+            thought_option = option_by_category.get("thought_level")
+            config[
+                thought_option.id if thought_option else "thought_level"
+            ] = message.effort
+        return AgentPrompt(
+            text=message.text,
+            attachments=tuple(message.attachments),
+            working_directory=getattr(self.service, "current_project", ""),
+            config=config,
+            mode=message.collaboration_mode or "",
+            access_mode=message.access_mode,
+            run_mode_id=message.run_mode_id,
+        )
 
     def _dispatch_command(self, command: QueuedCommand) -> None:
         invoke = getattr(self.service, "invoke_action", None)
@@ -3105,7 +3152,7 @@ class MainWindow(QMainWindow):
         count = len(self._message_queue)
         state = (
             "РЕДАКТИРОВАНИЕ"
-            if self._editing_queued_message is not None
+            if self._editing_queued_message is not None or self._editing_message_item_id
             else "ПРИОСТАНОВЛЕНА"
             if self._queue_paused
             else "ОЧЕРЕДЬ"
@@ -3170,9 +3217,15 @@ class MainWindow(QMainWindow):
             and not self._turn_active
             and not self._queue_action_pending
             and self._editing_queued_message is None
+            and not self._editing_message_item_id
         )
         self.queue_panel.setVisible(bool(count))
-        navigation_enabled = not self._turn_active and not self._queue_action_pending
+        navigation_enabled = (
+            not self._turn_active
+            and not self._queue_action_pending
+            and self._editing_queued_message is None
+            and not self._editing_message_item_id
+        )
         self.new_chat_button.setEnabled(navigation_enabled)
         self.new_chat_shortcut_label.setEnabled(navigation_enabled)
         self.thread_list.setEnabled(navigation_enabled)
@@ -3207,8 +3260,22 @@ class MainWindow(QMainWindow):
         if self._thinking_indicator is not None:
             self._thinking_indicator.stop()
             self._thinking_indicator = None
+        self._editing_message_item_id = ""
+        self._editing_message_draft_text = ""
+        self._editing_message_draft_attachments.clear()
+        self._message_edit_pending = False
+        if hasattr(self, "message_edit_banner"):
+            self.message_edit_banner.setVisible(False)
+        composer_panel = self.composer.parentWidget() if hasattr(self, "composer") else None
+        if composer_panel is not None:
+            composer_panel.setProperty("editingMessage", False)
+            composer_panel.style().unpolish(composer_panel)
+            composer_panel.style().polish(composer_panel)
+        if hasattr(self, "send_button"):
+            self._refresh_send_button()
         self.cards.clear()
         self._execution_plan_cards.clear()
+        self._message_items.clear()
         self._last_activity_group = None
         self._latest_activity_card = None
         self._latest_activity_group = None
@@ -3287,6 +3354,7 @@ class MainWindow(QMainWindow):
 
     def _upsert_item(self, item: dict[str, Any], complete: bool) -> None:
         item_id = str(item.get("id") or uuid.uuid4())
+        self._message_items[item_id] = dict(item)
         kind = str(item.get("kind") or item.get("type", "unknown"))
         subtype = str(item.get("subtype") or item.get("type", ""))
         card = self.cards.get(item_id)
@@ -3395,7 +3463,7 @@ class MainWindow(QMainWindow):
         self.cards[item_id] = card
         self._last_activity_group = None
         if isinstance(card, MessageCard):
-            card.editRequested.connect(self._edit_message)
+            card.editRequested.connect(lambda _text, target=item_id: self._edit_message(target))
         if isinstance(card, MessageCard) and card.role == "user":
             self.timeline_layout.insertWidget(
                 self.timeline_layout.count() - 1,
@@ -3407,13 +3475,201 @@ class MainWindow(QMainWindow):
             self.timeline_layout.insertWidget(self.timeline_layout.count() - 1, card)
         self._move_thinking_to_bottom()
 
-    def _edit_message(self, text: str) -> None:
-        self.composer.setPlainText(text)
-        cursor = self.composer.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        self.composer.setTextCursor(cursor)
-        self.composer.setFocus()
-        self.statusBar().showMessage("Текст сообщения перенесён в поле ввода", 3000)
+    def _supports_message_edit(self) -> bool:
+        checker = getattr(self.service, "supports_message_edit", None)
+        if callable(checker):
+            return bool(checker())
+        return callable(getattr(self.service, "edit_message", None))
+
+    def _edit_message(self, item_id_or_text: str) -> None:
+        card = self.cards.get(item_id_or_text)
+        if isinstance(card, MessageCard) and card.role == "user":
+            if not self._supports_message_edit():
+                self._show_notice(
+                    f"{self._agent_name()} не поддерживает редактирование отправленных сообщений.",
+                    "warning",
+                    5000,
+                )
+                return
+            if self._turn_active:
+                self._show_notice(
+                    "Дождитесь завершения текущего ответа или остановите его перед редактированием.",
+                    "warning",
+                    5000,
+                )
+                return
+            if self._editing_queued_message is not None:
+                self._finish_queue_edit(resume_queue=False)
+            if self._editing_message_item_id:
+                self._finish_message_edit(resume_queue=False)
+            self._editing_message_item_id = item_id_or_text
+            self._editing_message_draft_text = self.composer.toPlainText()
+            self._editing_message_draft_attachments = list(self.attachments)
+            self.attachments.clear()
+            self._render_attachments()
+            self.composer.setPlainText(card.text)
+            cursor = self.composer.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            self.composer.setTextCursor(cursor)
+            raw_item = self._message_items.get(item_id_or_text)
+            attachment_count = 0
+            if isinstance(raw_item, dict):
+                content = raw_item.get("content", [])
+                if isinstance(content, list):
+                    attachment_count = sum(
+                        1
+                        for block in content
+                        if isinstance(block, dict) and block.get("type") not in {"text", None}
+                    )
+            index = 0
+            for position, (card_id, message_card) in enumerate(self.cards.items(), start=1):
+                if card_id == item_id_or_text and isinstance(message_card, MessageCard):
+                    index = position
+                    break
+            attachment_note = f" · Вложений: {attachment_count}" if attachment_count else ""
+            self.message_edit_detail.setText(
+                f"Сообщение №{index or '?'}{attachment_note} · Enter — сохранить · Shift+Enter — новая строка"
+            )
+            self.message_edit_banner.setVisible(True)
+            self.attach_button.setEnabled(False)
+            self.access_combo.setEnabled(False)
+            self.access_shortcut_label.setEnabled(False)
+            self._refresh_access_shortcut_style()
+            self.settings_button.setEnabled(False)
+            composer_panel = self.composer.parentWidget()
+            if composer_panel is not None:
+                composer_panel.setProperty("editingMessage", True)
+                composer_panel.style().unpolish(composer_panel)
+                composer_panel.style().polish(composer_panel)
+            self._refresh_send_button()
+            self._render_message_queue()
+            self.composer.setFocus()
+            self.statusBar().showMessage("Сообщение готово к редактированию", 3000)
+            return
+
+    def _save_message_edit(self) -> None:
+        item_id = self._editing_message_item_id
+        if not item_id or self._message_edit_pending:
+            return
+        text = self.composer.toPlainText().strip()
+        attachments = self._history_message_attachments(item_id)
+        if not text and not attachments:
+            self._show_notice(
+                "Сообщение без текста или вложений нельзя сохранить.",
+                "warning",
+            )
+            return
+        missing = [str(item.path) for item in attachments if not item.path.is_file()]
+        if missing:
+            self._show_error(
+                "Вложения исходного сообщения больше не существуют:\n" + "\n".join(missing)
+            )
+            return
+        editor = getattr(self.service, "edit_message", None)
+        if not callable(editor):
+            self._show_notice(
+                f"{self._agent_name()} не поддерживает редактирование отправленных сообщений.",
+                "warning",
+                5000,
+            )
+            return
+        selected_mode = str(self.access_combo.currentData() or "")
+        run_mode = next(
+            (item for item in self.agent_manifest.run_modes if item.id == selected_mode),
+            None,
+        )
+        if run_mode is None:
+            run_mode = next(
+                (item for item in self._legacy_codex_run_modes() if item.id == selected_mode),
+                None,
+            )
+        collaboration_mode = (
+            PLAN_MODE_VALUE if run_mode is not None and run_mode.tone == "plan" else None
+        )
+        if collaboration_mode:
+            access_mode = AccessMode.READ_ONLY
+        else:
+            try:
+                access_mode = AccessMode(selected_mode)
+            except ValueError:
+                access_mode = AccessMode.WORKSPACE_WRITE
+        message = QueuedMessage(
+            text,
+            attachments,
+            self.model_combo.currentData() or "",
+            self.effort_combo.currentData(),
+            access_mode,
+            collaboration_mode,
+            config=self._current_agent_config(),
+            run_mode_id=selected_mode,
+        )
+        self._message_edit_pending = True
+        self.message_edit_detail.setText("Создаётся новая ветка и отправляется исправленный запрос…")
+        self._refresh_send_button()
+        self.message_edit_cancel_button.setEnabled(False)
+
+        def finished(success: bool) -> None:
+            self._message_edit_pending = False
+            if success:
+                self._finish_message_edit(resume_queue=False)
+                self.statusBar().showMessage(
+                    "Создана ветка с исправленным сообщением",
+                    5000,
+                )
+                return
+            self.message_edit_cancel_button.setEnabled(True)
+            self.message_edit_detail.setText(
+                "Не удалось создать ветку · исправьте сообщение или отмените редактирование"
+            )
+            self._refresh_send_button()
+
+        editor(item_id, self._agent_prompt(message), finished)
+
+    def _cancel_message_edit(self) -> None:
+        self._finish_message_edit()
+
+    def _finish_message_edit(self, *, resume_queue: bool = True) -> None:
+        if not self._editing_message_item_id:
+            return
+        self._editing_message_item_id = ""
+        self._message_edit_pending = False
+        self.message_edit_banner.setVisible(False)
+        self.message_edit_cancel_button.setEnabled(True)
+        self.composer.setPlainText(self._editing_message_draft_text)
+        self.attachments = list(self._editing_message_draft_attachments)
+        self._editing_message_draft_text = ""
+        self._editing_message_draft_attachments.clear()
+        self._render_attachments()
+        self.attach_button.setEnabled(True)
+        self.access_combo.setEnabled(True)
+        self.access_shortcut_label.setEnabled(True)
+        self._refresh_access_shortcut_style()
+        self.settings_button.setEnabled(True)
+        composer_panel = self.composer.parentWidget()
+        if composer_panel is not None:
+            composer_panel.setProperty("editingMessage", False)
+            composer_panel.style().unpolish(composer_panel)
+            composer_panel.style().polish(composer_panel)
+        self._refresh_send_button()
+        self._render_message_queue()
+        self._apply_agent_capabilities()
+        if resume_queue:
+            QTimer.singleShot(0, self._send_next_queued)
+
+    def _history_message_attachments(self, item_id: str) -> list[Attachment]:
+        raw_item = self._message_items.get(item_id)
+        content = raw_item.get("content", []) if isinstance(raw_item, dict) else []
+        if not isinstance(content, list):
+            return []
+        attachments: list[Attachment] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            kind = block.get("type")
+            path = str(block.get("path") or "")
+            if kind in {"localImage", "mention"} and path:
+                attachments.append(Attachment(Path(path), kind == "localImage"))
+        return attachments
 
     def _activity(self, item_id: str, title: str, content: str) -> ActivityCard:
         card = self.cards.get(item_id)
@@ -3533,10 +3789,10 @@ class MainWindow(QMainWindow):
         self.agent_combo.setEnabled(not active and not bool(self._message_queue))
         self.model_combo.setEnabled(True)
         self.effort_combo.setEnabled(True)
-        editing_queue = self._editing_queued_message is not None
-        self.attach_button.setEnabled(not editing_queue)
-        self.access_combo.setEnabled(not editing_queue)
-        self.settings_button.setEnabled(not editing_queue)
+        editing = self._editing_queued_message is not None or self._editing_message_item_id
+        self.attach_button.setEnabled(not editing)
+        self.access_combo.setEnabled(not editing)
+        self.settings_button.setEnabled(not editing)
         self._refresh_access_style()
         self._apply_agent_capabilities()
         self._render_message_queue()
@@ -3575,6 +3831,15 @@ class MainWindow(QMainWindow):
             self.send_button.setAccessibleName(
                 "Сохранить изменения сообщения в очереди"
             )
+            self.send_button.setEnabled(True)
+            return
+        if self._editing_message_item_id:
+            self.send_button.setIcon(asset_icon("save.svg"))
+            self.send_button.setToolTip(
+                "Сохранить изменения · Enter (Shift+Enter — новая строка)"
+            )
+            self.send_button.setAccessibleName("Сохранить изменения сообщения")
+            self.send_button.setEnabled(not self._message_edit_pending)
             return
         self.send_button.setIcon(
             asset_icon("queue.svg" if self._turn_active else "send.svg")
@@ -3589,6 +3854,7 @@ class MainWindow(QMainWindow):
             if self._turn_active
             else "Отправить сообщение"
         )
+        self.send_button.setEnabled(True)
 
     def _add_turn_duration(self, status: str, elapsed_ms: int) -> None:
         if status == "failed":

@@ -81,6 +81,7 @@ QSplitter::handle { background: #2a2d2d; }
 #composerArea { background: transparent; }
 #composerPanel { background: #1b1e1f; border: 1px solid #3a3e3d; border-radius: 14px; }
 #composerPanel[editingQueue="true"] { border: 1px solid #6c5b36; background: #1d1d1a; }
+#composerPanel[editingMessage="true"] { border: 1px solid #46606c; background: #1b2327; }
 #composer { background: transparent; color: #eeeeeb; border: 0; padding: 7px 5px; font-size: 14px; }
 #composer:disabled { color: #747874; }
 #composerHint { color: #8d938e; font-size: 11px; padding-top: 3px; }
@@ -94,6 +95,12 @@ QSplitter::handle { background: #2a2d2d; }
 #queueEditDetail { color: #b9b09b; font-size: 11px; }
 #queueEditCancel { background: transparent; color: #c6bead; border: 1px solid #554e3e; padding: 5px 9px; }
 #queueEditCancel:hover { background: #363023; color: #fff5df; }
+#messageEditBanner { background: #23292d; border: 1px solid #46606c; border-radius: 9px; }
+#messageEditIcon { color: #90bfd0; font-size: 16px; }
+#messageEditTitle { color: #b9d8e3; font-size: 10px; font-weight: 700; letter-spacing: 1px; }
+#messageEditDetail { color: #aec0c9; font-size: 11px; }
+#messageEditCancel { background: transparent; color: #c2d3db; border: 1px solid #49606b; padding: 5px 9px; }
+#messageEditCancel:hover { background: #2f3e45; color: #eef8fc; }
 #slashCommandPanel { background: #1b1e1d; border: 1px solid #3a403c; border-radius: 11px; }
 #slashCommandList { background: transparent; border: 0; outline: 0; }
 #slashCommandList::item { color: #aeb5b0; border: 0; border-radius: 7px; padding: 5px 9px; }

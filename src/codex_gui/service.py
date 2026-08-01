@@ -842,6 +842,161 @@ class CodexDriver(AgentDriver):
             forked,
         )
 
+    def supports_message_edit(self) -> bool:
+        """Codex can replace a turn by forking the thread before that turn."""
+        return True
+
+    def edit_message(
+        self,
+        item_id: str,
+        prompt: AgentPrompt,
+        callback: Any | None = None,
+    ) -> None:
+        """Fork before a user message and submit its replacement on the fork."""
+        source_thread_id = self.current_thread_id
+        if not source_thread_id:
+            self.errorOccurred.emit("Сначала откройте чат")
+            if callback:
+                callback(False)
+            return
+        if self.current_turn_id or self._turn_start_pending:
+            self.errorOccurred.emit("Сообщение нельзя редактировать во время выполнения")
+            if callback:
+                callback(False)
+            return
+
+        def fail(message: str = "") -> None:
+            if message:
+                self.errorOccurred.emit(message)
+            if callback:
+                callback(False)
+
+        def submit_on_thread(thread: dict[str, Any]) -> None:
+            thread_id = str(thread.get("id", ""))
+            if not thread_id:
+                fail("Codex не вернул идентификатор новой ветки")
+                return
+            self.current_thread_id = thread_id
+            self.current_turn_id = ""
+            self.current_thread_ready = True
+            self.currentThreadChanged.emit(thread_id)
+            if callback:
+                callback(True)
+            normalized = normalize_codex_thread(thread)
+            self.sessionLoaded.emit(SessionSnapshot(thread_id, raw=normalized))
+            self.threadLoaded.emit(normalized)
+            self.submit_prompt(prompt)
+            self.list_threads()
+
+        def start_without_history() -> None:
+            mode_id = prompt.run_mode_id or prompt.mode
+            access_mode = prompt.access_mode
+            if mode_id == PLAN_MODE_VALUE:
+                access_mode = AccessMode.READ_ONLY
+            if not isinstance(access_mode, AccessMode):
+                access_mode = AccessMode.WORKSPACE_WRITE
+            params: dict[str, Any] = {
+                "cwd": self.current_project,
+                "approvalPolicy": access_mode.approval_policy,
+                "ephemeral": False,
+                "serviceName": "codex_kostyl",
+            }
+            model = str(prompt.config.get("model", ""))
+            if model:
+                params["model"] = model
+
+            def started(result: Any, error: dict[str, Any] | None) -> None:
+                if error:
+                    self._emit_rpc_error(error)
+                    fail()
+                    return
+                thread = result.get("thread", {}) if isinstance(result, dict) else {}
+                submit_on_thread(thread if isinstance(thread, dict) else {})
+
+            self.rpc.request("thread/start", params, started)
+
+        def fork_through(previous_turn_id: str) -> None:
+            params = {
+                "threadId": source_thread_id,
+                "lastTurnId": previous_turn_id,
+                "ephemeral": False,
+            }
+
+            def forked(result: Any, error: dict[str, Any] | None) -> None:
+                if error:
+                    self._emit_rpc_error(error)
+                    fail()
+                    return
+                thread = result.get("thread", {}) if isinstance(result, dict) else {}
+                if not isinstance(thread, dict):
+                    thread = {}
+                thread_id = str(thread.get("id", ""))
+                if not thread_id:
+                    fail("Codex не вернул идентификатор новой ветки")
+                    return
+
+                def loaded(read_result: Any, read_error: dict[str, Any] | None) -> None:
+                    if read_error:
+                        self._emit_rpc_error(read_error)
+                        fail()
+                        return
+                    loaded_thread = (
+                        read_result.get("thread", {})
+                        if isinstance(read_result, dict)
+                        else {}
+                    )
+                    if not isinstance(loaded_thread, dict):
+                        loaded_thread = {"id": thread_id, "turns": []}
+                    submit_on_thread(loaded_thread)
+
+                self.rpc.request(
+                    "thread/read",
+                    {"threadId": thread_id, "includeTurns": True},
+                    loaded,
+                )
+
+            self.rpc.request("thread/fork", params, forked)
+
+        def read(result: Any, error: dict[str, Any] | None) -> None:
+            if error:
+                self._emit_rpc_error(error)
+                fail()
+                return
+            thread = result.get("thread", {}) if isinstance(result, dict) else {}
+            turns = thread.get("turns", []) if isinstance(thread, dict) else []
+            turns = [turn for turn in turns if isinstance(turn, dict)]
+            target_index = -1
+            for index, turn in enumerate(turns):
+                items = turn.get("items", [])
+                if any(
+                    isinstance(item, dict)
+                    and str(item.get("type", "")) in {"userMessage", "user_message"}
+                    and (
+                        str(item.get("id", "")) == item_id
+                        or str(item.get("clientId", "")) == item_id
+                    )
+                    for item in items
+                ):
+                    target_index = index
+                    break
+            if target_index < 0:
+                fail("Codex не нашёл редактируемое сообщение в истории")
+                return
+            if target_index == 0:
+                start_without_history()
+                return
+            previous_turn_id = str(turns[target_index - 1].get("id", ""))
+            if not previous_turn_id:
+                fail("Codex не вернул идентификатор предыдущего хода")
+                return
+            fork_through(previous_turn_id)
+
+        self.rpc.request(
+            "thread/read",
+            {"threadId": source_thread_id, "includeTurns": True},
+            read,
+        )
+
     def interrupt(self) -> None:
         if not self.current_thread_id or not self.current_turn_id:
             return

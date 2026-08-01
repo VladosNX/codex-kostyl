@@ -439,6 +439,162 @@ def test_fork_switches_after_loading_copy_and_refreshes_history(qtbot) -> None:
     assert all(method not in {"thread/archive", "thread/delete"} for method, _params in rpc.calls)
 
 
+def test_edit_message_forks_before_target_turn_and_resubmits(qtbot) -> None:
+    rpc = FakeRpc()
+    service = CodexService(rpc)  # type: ignore[arg-type]
+    service.connected = True
+    service.current_project = "/repo"
+    service.current_thread_id = "thr_source"
+    service.current_thread_ready = True
+    finished = []
+    prompt = AgentPrompt(
+        "Исправленный запрос",
+        config={"model": "gpt-test", "thought_level": "high"},
+        access_mode=AccessMode.WORKSPACE_WRITE,
+        run_mode_id=AccessMode.WORKSPACE_WRITE.value,
+    )
+
+    service.edit_message("msg_target", prompt, finished.append)
+    assert rpc.calls[0] == (
+        "thread/read",
+        {"threadId": "thr_source", "includeTurns": True},
+    )
+    rpc.callbacks[0](
+        {
+            "thread": {
+                "id": "thr_source",
+                "turns": [
+                    {"id": "turn_before", "items": []},
+                    {
+                        "id": "turn_target",
+                        "items": [{"id": "msg_target", "type": "userMessage"}],
+                    },
+                    {"id": "turn_after", "items": []},
+                ],
+            }
+        },
+        None,
+    )
+    assert rpc.calls[1] == (
+        "thread/fork",
+        {
+            "threadId": "thr_source",
+            "lastTurnId": "turn_before",
+            "ephemeral": False,
+        },
+    )
+    rpc.callbacks[1]({"thread": {"id": "thr_edited"}}, None)
+    assert rpc.calls[2] == (
+        "thread/read",
+        {"threadId": "thr_edited", "includeTurns": True},
+    )
+    rpc.callbacks[2](
+        {"thread": {"id": "thr_edited", "turns": [{"id": "turn_before", "items": []}]}},
+        None,
+    )
+
+    assert finished == [True]
+    assert service.current_thread_id == "thr_edited"
+    assert rpc.calls[3][0] == "turn/start"
+    assert rpc.calls[3][1]["threadId"] == "thr_edited"
+    assert rpc.calls[3][1]["input"] == [{"type": "text", "text": "Исправленный запрос"}]
+
+
+def test_edit_message_matches_client_id_when_thread_item_id_differs(qtbot) -> None:
+    rpc = FakeRpc()
+    service = CodexService(rpc)  # type: ignore[arg-type]
+    service.connected = True
+    service.current_project = "/repo"
+    service.current_thread_id = "thr_source"
+    service.current_thread_ready = True
+    finished = []
+    prompt = AgentPrompt(
+        "Исправленный запрос",
+        config={"model": "gpt-test"},
+        access_mode=AccessMode.WORKSPACE_WRITE,
+        run_mode_id=AccessMode.WORKSPACE_WRITE.value,
+    )
+
+    service.edit_message("local_msg_id", prompt, finished.append)
+    rpc.callbacks[0](
+        {
+            "thread": {
+                "id": "thr_source",
+                "turns": [
+                    {"id": "turn_before", "items": []},
+                    {
+                        "id": "turn_target",
+                        "items": [
+                            {
+                                "id": "server_msg_id",
+                                "clientId": "local_msg_id",
+                                "type": "userMessage",
+                            }
+                        ],
+                    },
+                ],
+            }
+        },
+        None,
+    )
+
+    assert rpc.calls[1] == (
+        "thread/fork",
+        {
+            "threadId": "thr_source",
+            "lastTurnId": "turn_before",
+            "ephemeral": False,
+        },
+    )
+    rpc.callbacks[1]({"thread": {"id": "thr_edited"}}, None)
+    rpc.callbacks[2]({"thread": {"id": "thr_edited", "turns": []}}, None)
+
+    assert finished == [True]
+    assert service.current_thread_id == "thr_edited"
+
+
+def test_edit_first_message_starts_clean_thread_before_resubmitting(qtbot) -> None:
+    rpc = FakeRpc()
+    service = CodexService(rpc)  # type: ignore[arg-type]
+    service.connected = True
+    service.current_project = "/repo"
+    service.current_thread_id = "thr_source"
+    service.current_thread_ready = True
+    finished = []
+    prompt = AgentPrompt(
+        "Новый первый запрос",
+        config={"model": "gpt-test"},
+        access_mode=AccessMode.READ_ONLY,
+        run_mode_id=AccessMode.READ_ONLY.value,
+    )
+
+    service.edit_message("msg_first", prompt, finished.append)
+    rpc.callbacks[0](
+        {
+            "thread": {
+                "id": "thr_source",
+                "turns": [
+                    {
+                        "id": "turn_first",
+                        "items": [{"id": "msg_first", "type": "userMessage"}],
+                    }
+                ],
+            }
+        },
+        None,
+    )
+
+    assert rpc.calls[1][0] == "thread/start"
+    assert rpc.calls[1][1]["cwd"] == "/repo"
+    assert rpc.calls[1][1]["approvalPolicy"] == "on-request"
+    rpc.callbacks[1]({"thread": {"id": "thr_clean", "turns": []}}, None)
+
+    assert finished == [True]
+    assert service.current_thread_id == "thr_clean"
+    assert rpc.calls[2][0] == "turn/start"
+    assert rpc.calls[2][1]["threadId"] == "thr_clean"
+
+
 def test_collaboration_mode_can_transition_from_plan_to_default(qtbot, tmp_path) -> None:
     rpc = FakeRpc()
     service = CodexService(rpc)  # type: ignore[arg-type]

@@ -18,7 +18,7 @@ from codex_gui.agents.base import (
     FeatureState,
     FeatureSupport,
 )
-from codex_gui.main_window import MainWindow, NumberedChoiceMenu, QueuedCommand
+from codex_gui.main_window import MainWindow, MessageCard, NumberedChoiceMenu, QueuedCommand
 from codex_gui.models import PLAN_MODE_VALUE, AccessMode, Attachment, ModelInfo, ThreadSummary
 
 
@@ -53,6 +53,7 @@ class FakeService(QObject):
         self.current_project = "/repo"
         self.current_thread_id = ""
         self.current_turn_id = ""
+        self.edits: list[tuple[str, AgentPrompt]] = []
 
     def send_message(self, *args) -> None:
         self.sent.append(args)
@@ -70,6 +71,16 @@ class FakeService(QObject):
         source = self.current_thread_id
         self.actions.append(("fork", source))
         self.current_thread_id = "thr_fork"
+        self.currentThreadChanged.emit(self.current_thread_id)
+        if callback:
+            callback(True)
+
+    def supports_message_edit(self) -> bool:
+        return True
+
+    def edit_message(self, item_id: str, prompt: AgentPrompt, callback=None) -> None:
+        self.edits.append((item_id, prompt))
+        self.current_thread_id = "thr_edited"
         self.currentThreadChanged.emit(self.current_thread_id)
         if callback:
             callback(True)
@@ -1146,6 +1157,86 @@ def test_queue_stops_after_command_error_and_keeps_remaining_items(qtbot) -> Non
 
     window._resume_queue()
     assert service.sent[-1][0] == "после ошибки"
+
+
+def test_user_message_edit_creates_real_agent_branch(qtbot) -> None:
+    window, service = make_window(qtbot)
+    window._upsert_item(
+        {
+            "id": "msg_1",
+            "kind": "user_message",
+            "content": [{"type": "text", "text": "Исходный текст"}],
+        },
+        True,
+    )
+
+    card = window.cards["msg_1"]
+    assert isinstance(card, MessageCard)
+    assert card.edit_button is not None
+    card.edit_button.click()
+
+    assert window.message_edit_banner.isHidden() is False
+    assert window.send_button.accessibleName() == "Сохранить изменения сообщения"
+    assert window.composer.toPlainText() == "Исходный текст"
+
+    window.composer.setPlainText("Изменённый текст")
+    window._send()
+
+    assert len(service.edits) == 1
+    item_id, prompt = service.edits[0]
+    assert item_id == "msg_1"
+    assert prompt.text == "Изменённый текст"
+    assert service.current_thread_id == "thr_edited"
+    assert service.sent == []
+    assert window.message_edit_banner.isHidden() is True
+    assert window.composer.toPlainText() == ""
+    assert window.send_button.isEnabled() is True
+
+
+def test_unsupported_agent_does_not_copy_message_into_composer(qtbot) -> None:
+    window, service = make_window(qtbot)
+    service.supports_message_edit = lambda: False  # type: ignore[method-assign]
+    window.composer.setPlainText("Черновик")
+    window._upsert_item(
+        {
+            "id": "msg_1",
+            "kind": "user_message",
+            "content": [{"type": "text", "text": "Исходный текст"}],
+        },
+        True,
+    )
+
+    card = window.cards["msg_1"]
+    assert isinstance(card, MessageCard)
+    assert card.edit_button is not None
+    card.edit_button.click()
+
+    assert window.composer.toPlainText() == "Черновик"
+    assert window.message_edit_banner.isHidden() is True
+    assert service.edits == []
+
+
+def test_new_request_restores_a_paused_queue_after_interrupt(qtbot) -> None:
+    window, service = make_window(qtbot)
+    service.current_thread_id = "thr_1"
+    window._turn_state("inProgress")
+    window.composer.setPlainText("Отложенное сообщение")
+    window._send()
+
+    window._turn_state("interrupted")
+    qtbot.wait(10)
+    assert window._queue_paused is True
+
+    window.composer.setPlainText("Новый запрос после остановки")
+    window._send()
+
+    assert window._queue_paused is False
+    assert service.sent[-1][0] == "Новый запрос после остановки"
+
+    window._turn_state("inProgress")
+    window._turn_state("completed")
+    qtbot.waitUntil(lambda: len(service.sent) == 2)
+    assert service.sent[1][0] == "Отложенное сообщение"
 
 
 def test_queue_keeps_message_when_its_attachment_disappears(qtbot, tmp_path) -> None:

@@ -462,6 +462,7 @@ class AcpDriver(AgentDriver):
             return
         user_item = {
             "id": message_id,
+            "clientId": message_id,
             "kind": "user_message",
             "subtype": "acp_user_message",
             "content": [block for block in blocks if block.get("type") == "text"],

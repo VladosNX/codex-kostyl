@@ -582,6 +582,30 @@ class AgentController(QObject):
     def fork_thread(self, callback: Any | None = None) -> None:
         self.invoke_action("fork", callback=callback)
 
+    def supports_message_edit(self) -> bool:
+        driver = self.active_driver
+        if driver is None:
+            return False
+        checker = getattr(driver, "supports_message_edit", None)
+        if callable(checker):
+            return bool(checker())
+        return callable(getattr(driver, "edit_message", None))
+
+    def edit_message(
+        self,
+        item_id: str,
+        prompt: AgentPrompt,
+        callback: Any | None = None,
+    ) -> None:
+        driver = self.active_driver
+        editor = getattr(driver, "edit_message", None) if driver is not None else None
+        if not callable(editor):
+            self.errorOccurred.emit("Выбранный агент не поддерживает редактирование сообщений")
+            if callback:
+                callback(False)
+            return
+        editor(item_id, prompt, callback)
+
     def answer_approval(self, *args: Any, **kwargs: Any) -> None:
         self._call("answer_approval", *args, **kwargs)
 
