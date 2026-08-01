@@ -19,6 +19,7 @@ from .base import (
     AgentManifest,
     AgentProfile,
     AgentPrompt,
+    AgentRunMode,
     AgentState,
     AuthMethod,
     ClientRequest,
@@ -80,6 +81,7 @@ class AcpDriver(AgentDriver):
         self._message_buffers: dict[str, str] = {}
         self._prompt_request_id: int | None = None
         self._session_generation = 0
+        self._session_requests: dict[int, list[Any]] = {}
 
         rpc.notification.connect(self._notification)
         rpc.serverRequest.connect(self._server_request)
@@ -181,6 +183,8 @@ class AcpDriver(AgentDriver):
         self.manifestUpdated.emit(self.manifest)
         self.accountUpdated.emit({"account": self.account})
         self._emit_state("idle")
+        if self.current_project:
+            self.prepare_new_session()
         self.list_sessions()
         self.ready.emit()
 
@@ -251,7 +255,7 @@ class AcpDriver(AgentDriver):
 
     def set_project(self, path: str) -> None:
         self.current_project = str(Path(path).resolve())
-        self.prepare_new_session()
+        self._reset_session()
         self.list_sessions()
 
     def list_sessions(self) -> None:
@@ -329,15 +333,25 @@ class AcpDriver(AgentDriver):
         self.rpc.request(method, params, loaded)
 
     def prepare_new_session(self) -> None:
+        self._reset_session()
+        if self.connected and self.current_project:
+            self._create_session(
+                lambda ok: self._emit_state("idle") if ok else None,
+                self._session_generation,
+            )
+
+    def _reset_session(self) -> None:
+        self._session_generation += 1
         self.current_session_id = ""
         self.current_run_id = ""
+        self.current_run_mode_id = ""
         self.config_options = ()
         self._protocol_config_options = ()
         self._mode_option = None
         self._stream_item_ids.clear()
         self._message_buffers.clear()
         self.currentThreadChanged.emit("")
-        self.configOptionsUpdated.emit(())
+        self._publish_config_options()
         self._emit_state("idle")
 
     def submit_prompt(self, prompt: AgentPrompt) -> None:
@@ -349,30 +363,45 @@ class AcpDriver(AgentDriver):
             return
         self._submit_after_session(prompt)
 
-    def _create_session(self, callback: Any) -> None:
+    def _create_session(self, callback: Any, generation: int | None = None) -> None:
         if not self.current_project:
             self.errorOccurred.emit("Сначала выберите рабочую папку")
             callback(False)
             return
-        self.turnStateChanged.emit("starting")
+        generation = self._session_generation if generation is None else generation
+        callbacks = self._session_requests.get(generation)
+        if callbacks is not None:
+            callbacks.append(callback)
+            return
+        self._session_requests[generation] = [callback]
         self.rpc.request(
             "session/new",
             {"cwd": self.current_project, "mcpServers": []},
-            lambda result, error: self._session_created(result, error, callback),
+            lambda result, error: self._session_created(result, error, generation),
         )
 
-    def _session_created(self, result: Any, error: dict[str, Any] | None, callback: Any) -> None:
+    def _session_created(
+        self,
+        result: Any,
+        error: dict[str, Any] | None,
+        generation: int,
+    ) -> None:
+        callbacks = self._session_requests.pop(generation, [])
+        if generation != self._session_generation:
+            for callback in callbacks:
+                callback(False)
+            return
         if error:
-            self.turnStateChanged.emit("failed")
             self._rpc_error(error)
-            callback(False)
+            for callback in callbacks:
+                callback(False)
             return
         payload = result if isinstance(result, dict) else {}
         session_id = str(payload.get("sessionId", ""))
         if not session_id:
-            self.turnStateChanged.emit("failed")
             self.errorOccurred.emit("ACP-агент не вернул sessionId")
-            callback(False)
+            for callback in callbacks:
+                callback(False)
             return
         self.current_session_id = session_id
         self.currentThreadChanged.emit(session_id)
@@ -380,16 +409,29 @@ class AcpDriver(AgentDriver):
         self.threadLoaded.emit({"id": session_id, "turns": []})
         self._apply_config_options(payload.get("configOptions", []))
         self._apply_modes(payload.get("modes"))
-        callback(True)
+        for callback in callbacks:
+            callback(True)
 
     def _submit_after_session(self, prompt: AgentPrompt) -> None:
         requested_config = dict(prompt.config)
+        run_mode_id = prompt.run_mode_id or prompt.mode
+        protocol_mode = next(
+            (option for option in self._protocol_config_options if option.category == "mode"),
+            None,
+        )
         if (
-            prompt.mode
-            and self._mode_option is not None
-            and any(value.value == prompt.mode for value in self._mode_option.values)
+            run_mode_id
+            and protocol_mode is not None
+            and any(value.value == run_mode_id for value in protocol_mode.values)
         ):
-            requested_config[ACP_MODE_OPTION_ID] = prompt.mode
+            requested_config[protocol_mode.id] = run_mode_id
+        if (
+            run_mode_id
+            and protocol_mode is None
+            and self._mode_option is not None
+            and any(value.value == run_mode_id for value in self._mode_option.values)
+        ):
+            requested_config[ACP_MODE_OPTION_ID] = run_mode_id
         changes = [
             (key, value)
             for key, value in requested_config.items()
@@ -545,6 +587,16 @@ class AcpDriver(AgentDriver):
 
         self.rpc.request("session/set_config_option", params, changed)
 
+    def set_run_mode(self, mode_id: str) -> None:
+        option = next(
+            (item for item in self._protocol_config_options if item.category == "mode"),
+            self._mode_option,
+        )
+        if option is None or not any(value.value == mode_id for value in option.values):
+            self.errorOccurred.emit(f"ACP-агент не поддерживает режим {mode_id}")
+            return
+        self.set_config_option(option.id, mode_id)
+
     def _set_mode(self, mode_id: str, callback: Any | None) -> None:
         def changed(result: Any, error: dict[str, Any] | None) -> None:
             if error:
@@ -692,7 +744,7 @@ class AcpDriver(AgentDriver):
             self._apply_config_options(update.get("configOptions", []))
             return
         if kind == "current_mode_update":
-            mode_id = str(update.get("currentModeId") or "")
+            mode_id = str(update.get("modeId") or update.get("currentModeId") or "")
             if self._mode_option is not None and mode_id:
                 self._mode_option = replace(self._mode_option, current_value=mode_id)
                 self._publish_config_options()
@@ -767,11 +819,29 @@ class AcpDriver(AgentDriver):
         self._publish_config_options()
 
     def _publish_config_options(self) -> None:
+        protocol_mode = next(
+            (option for option in self._protocol_config_options if option.category == "mode"),
+            None,
+        )
+        fallback_mode = self._mode_option if protocol_mode is None else None
         self.config_options = self._protocol_config_options + (
-            (self._mode_option,) if self._mode_option is not None else ()
+            (fallback_mode,) if fallback_mode is not None else ()
+        )
+        mode_option = protocol_mode or fallback_mode
+        run_modes = (
+            tuple(
+                AgentRunMode(value.value, value.label, value.description)
+                for value in mode_option.values
+            )
+            if mode_option is not None
+            else ()
+        )
+        self.current_run_mode_id = (
+            str(mode_option.current_value) if mode_option is not None else ""
         )
         features = dict(self.manifest.features)
         categories = {option.category for option in self.config_options}
+        features[FeatureId.ACCESS_MODES.value] = FeatureSupport(bool(run_modes))
         features[FeatureId.CONFIG_MODEL.value] = FeatureSupport("model" in categories)
         features[FeatureId.CONFIG_THOUGHT_LEVEL.value] = FeatureSupport("thought_level" in categories)
         features[FeatureId.RUN_PLAN.value] = FeatureSupport(
@@ -781,7 +851,13 @@ class AcpDriver(AgentDriver):
                 for option in self.config_options
             )
         )
-        self.manifest = replace(self.manifest, features=features, config_options=self.config_options)
+        self.manifest = replace(
+            self.manifest,
+            features=features,
+            config_options=self.config_options,
+            run_modes=run_modes,
+            current_run_mode_id=self.current_run_mode_id,
+        )
         self.manifestUpdated.emit(self.manifest)
         self.configOptionsUpdated.emit(self.config_options)
 
@@ -812,6 +888,7 @@ class AcpDriver(AgentDriver):
                 self.profile.id,
                 self.current_session_id,
                 self.current_run_id,
+                current_run_mode_id=self.current_run_mode_id,
             )
         )
 

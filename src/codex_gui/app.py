@@ -98,6 +98,7 @@ QSplitter::handle { background: #2a2d2d; }
 #accessCombo { color: #d4ddd7; background: #202a24; border: 1px solid #385044; border-radius: 8px; padding: 5px 8px; min-height: 20px; font-size: 11px; }
 #accessCombo[mode="safe"] { color: #b8d8c2; background: #18251e; border-color: #31503c; }
 #accessCombo[mode="workspace"] { color: #d4ddd7; background: #202a24; border-color: #385044; }
+#accessCombo[mode="neutral"] { color: #d2d5d2; background: #252827; border-color: #444a47; }
 #accessCombo[mode="plan"] { color: #d2c9eb; background: #251f32; border-color: #51436d; }
 #accessCombo[mode="danger"] { color: #efb8b2; background: #301e1e; border-color: #70413d; }
 #accessCombo[nextTurn="true"] { border-style: dashed; }

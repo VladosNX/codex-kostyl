@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import QObject, Signal
 
+from codex_gui.agents import AgentPrompt
 from codex_gui.models import AccessMode
 from codex_gui.service import CodexService
 
@@ -73,6 +74,27 @@ def test_plan_mode_uses_collaboration_mode_and_read_only_sandbox(qtbot, tmp_path
     }
     assert params["model"] == "gpt-test"
     assert params["effort"] == "high"
+
+
+def test_codex_driver_maps_generic_run_mode_to_native_policies(qtbot, tmp_path) -> None:
+    rpc = FakeRpc()
+    service = CodexService(rpc)  # type: ignore[arg-type]
+    service.current_project = str(tmp_path)
+    service.current_thread_id = "thr_1"
+    service.current_thread_ready = True
+
+    service.submit_prompt(
+        AgentPrompt(
+            "Prepare a plan",
+            config={"model": "gpt-test", "thought_level": "high"},
+            run_mode_id="plan",
+        )
+    )
+
+    method, params = rpc.calls[-1]
+    assert method == "turn/start"
+    assert params["sandboxPolicy"]["type"] == "readOnly"
+    assert params["collaborationMode"]["mode"] == "plan"
 
 
 def test_full_access_disables_command_approval_prompts(qtbot, tmp_path) -> None:

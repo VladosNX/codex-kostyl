@@ -109,6 +109,7 @@ class AgentController(QObject):
         self.current_project = ""
         self.current_session_id = ""
         self.current_run_id = ""
+        self.current_run_mode_id = ""
         self.connected = False
         self.account: dict[str, Any] | None = None
         self.state = AgentState()
@@ -192,6 +193,7 @@ class AgentController(QObject):
         self.capabilities = AgentCapabilities.from_manifest(self.manifest)
         self.availability = availability
         self.current_project = previous_project
+        self.current_run_mode_id = driver.current_run_mode_id
         if previous_project:
             driver.current_project = previous_project
         self._connect_driver(driver)
@@ -235,6 +237,7 @@ class AgentController(QObject):
                 return
             self.manifest = manifest
             self.capabilities = AgentCapabilities.from_manifest(manifest)
+            self.current_run_mode_id = manifest.current_run_mode_id
             self.manifestUpdated.emit(manifest)
             self._publish_state()
 
@@ -288,6 +291,7 @@ class AgentController(QObject):
         self.connected = False
         self.current_session_id = ""
         self.current_run_id = ""
+        self.current_run_mode_id = ""
         self.account = None
         self._publish_state()
 
@@ -299,6 +303,7 @@ class AgentController(QObject):
         self.current_project = str(driver.current_project)
         self.current_session_id = str(driver.current_session_id)
         self.current_run_id = str(driver.current_run_id)
+        self.current_run_mode_id = str(driver.current_run_mode_id)
         self.account = driver.account
         self._publish_state()
 
@@ -314,6 +319,7 @@ class AgentController(QObject):
             account_summary=self.account,
             context_usage=self.state.context_usage,
             quota_usage=self.state.quota_usage,
+            current_run_mode_id=self.current_run_mode_id,
         )
         self.stateUpdated.emit(self.state)
         self.featureStatesChanged.emit(feature_states)
@@ -463,6 +469,10 @@ class AgentController(QObject):
         self._call(method, session_id)
 
     def prepare_new_session(self) -> None:
+        # MainWindow restores the last project before app.py activates the
+        # selected profile. The driver will prepare its session after startup.
+        if self.active_driver is None:
+            return
         method = "prepare_new_session" if callable(getattr(self.active_driver, "prepare_new_session", None)) else "prepare_new_thread"
         self._call(method)
 
@@ -487,6 +497,14 @@ class AgentController(QObject):
         setter = getattr(self.settings, "agent_set", None)
         if callable(setter):
             setter(self.active_profile_id, option_id, value)
+
+    def set_run_mode(self, mode_id: str) -> None:
+        if callable(getattr(self.active_driver, "set_run_mode", None)):
+            self._call("set_run_mode", mode_id)
+            return
+        setter = getattr(self.settings, "agent_set", None)
+        if callable(setter):
+            setter(self.active_profile_id, "run_mode", mode_id)
 
     def cancel_run(self) -> None:
         method = "cancel_run" if callable(getattr(self.active_driver, "cancel_run", None)) else "interrupt"

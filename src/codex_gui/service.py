@@ -21,6 +21,7 @@ from .agents.base import (
     AgentManifest,
     AgentProfile,
     AgentPrompt,
+    AgentRunMode,
     AgentState,
     AuthMethod,
     ConfigOptionValue,
@@ -62,6 +63,33 @@ CODEX_CAPABILITIES = AgentCapabilities(
     review=True,
     fork=True,
 )
+CODEX_RUN_MODES = (
+    AgentRunMode(
+        AccessMode.READ_ONLY.value,
+        AccessMode.READ_ONLY.title,
+        "Codex не сможет изменять файлы",
+        "safe",
+    ),
+    AgentRunMode(
+        AccessMode.WORKSPACE_WRITE.value,
+        AccessMode.WORKSPACE_WRITE.title,
+        "Изменения разрешены только внутри проекта",
+        "workspace",
+    ),
+    AgentRunMode(
+        AccessMode.FULL_ACCESS.value,
+        AccessMode.FULL_ACCESS.title,
+        "Команды выполняются без дополнительных подтверждений",
+        "danger",
+        True,
+    ),
+    AgentRunMode(
+        PLAN_MODE_VALUE,
+        "Режим планирования",
+        "Анализ без изменения файлов",
+        "plan",
+    ),
+)
 CODEX_MANIFEST = AgentManifest(
     features={
         feature.value: FeatureSupport(True)
@@ -94,6 +122,8 @@ CODEX_MANIFEST = AgentManifest(
         AuthMethod("api-key", "Войти с API-ключом", "secret"),
     ),
     implementation_name="codex",
+    run_modes=CODEX_RUN_MODES,
+    current_run_mode_id=AccessMode.WORKSPACE_WRITE.value,
 )
 
 
@@ -232,6 +262,7 @@ class CodexDriver(AgentDriver):
                 active_profile_id=self.profile.id,
                 active_session_id=self.current_session_id,
                 active_run_id=self.current_run_id,
+                current_run_mode_id=self.current_run_mode_id,
             )
         )
 
@@ -645,17 +676,34 @@ class CodexDriver(AgentDriver):
         self.prepare_new_thread()
 
     def submit_prompt(self, prompt: AgentPrompt) -> None:
-        access_mode = prompt.access_mode
-        if not isinstance(access_mode, AccessMode):
-            access_mode = AccessMode.WORKSPACE_WRITE
+        mode_id = prompt.run_mode_id or prompt.mode
+        collaboration_mode = prompt.mode or None
+        if mode_id == PLAN_MODE_VALUE:
+            access_mode = AccessMode.READ_ONLY
+            collaboration_mode = PLAN_MODE_VALUE
+        else:
+            try:
+                access_mode = AccessMode(mode_id)
+            except ValueError:
+                access_mode = prompt.access_mode
+                if not isinstance(access_mode, AccessMode):
+                    access_mode = AccessMode.WORKSPACE_WRITE
         self.send_message(
             prompt.text,
             list(prompt.attachments),
             str(prompt.config.get("model", "")),
             str(prompt.config.get("thought_level") or "") or None,
             access_mode,
-            prompt.mode or None,
+            collaboration_mode,
         )
+
+    def set_run_mode(self, mode_id: str) -> None:
+        if not any(mode.id == mode_id for mode in self.manifest.run_modes):
+            self.errorOccurred.emit(f"Codex не поддерживает режим {mode_id}")
+            return
+        self.current_run_mode_id = mode_id
+        self.manifest = replace(self.manifest, current_run_mode_id=mode_id)
+        self.manifestUpdated.emit(self.manifest)
 
     def cancel_run(self) -> None:
         self.interrupt()

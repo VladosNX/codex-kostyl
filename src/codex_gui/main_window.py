@@ -61,6 +61,7 @@ from .agents.base import (
     AgentManifest,
     AgentProfile,
     AgentPrompt,
+    AgentRunMode,
     AuthMethod,
     FeatureId,
     FeatureState,
@@ -125,6 +126,7 @@ class QueuedMessage:
     collaboration_mode: str | None
     queue_syntax: str | None = None
     config: dict[str, str | bool] = dataclass_field(default_factory=dict)
+    run_mode_id: str = ""
 
 
 @dataclass(slots=True)
@@ -921,7 +923,8 @@ class MainWindow(QMainWindow):
         self._agent_settings_dialog: AgentSettingsDialog | None = None
         self.models: list[ModelInfo] = []
         self.agent_config_options: tuple[AgentConfigOption, ...] = ()
-        self.agent_manifest = AgentManifest()
+        manifest = getattr(service, "manifest", None)
+        self.agent_manifest = manifest if isinstance(manifest, AgentManifest) else AgentManifest()
         self.attachments: list[Attachment] = []
         self.cards: dict[str, MessageCard | ActivityCard] = {}
         self._execution_plan_cards: dict[str, ExecutionPlanCard] = {}
@@ -945,6 +948,9 @@ class MainWindow(QMainWindow):
         self._slash_help_visible = False
         self._auto_follow = True
         self._danger_acknowledged = False
+        self._loading_existing_session = False
+        self._run_mode_context: tuple[str, str] | None = None
+        self._pending_run_mode_id = ""
         self._sidebar_user_hidden = False
         self._sidebar_auto_hidden = False
         self._closing = False
@@ -1124,10 +1130,7 @@ class MainWindow(QMainWindow):
         self.effort_combo.setVisible(False)
         self.access_combo = QComboBox()
         self.access_combo.setObjectName("accessCombo")
-        self.access_combo.setAccessibleName("Режим доступа")
-        for mode in AccessMode:
-            self.access_combo.addItem(mode.title, mode.value)
-        self.access_combo.addItem("Режим планирования", PLAN_MODE_VALUE)
+        self.access_combo.setAccessibleName("Режим агента")
 
         self.scroll = QScrollArea()
         self.scroll.setObjectName("conversationScroll")
@@ -1544,6 +1547,8 @@ class MainWindow(QMainWindow):
             self._populate_agents()
 
     def _active_agent_changed(self, agent_id: str) -> None:
+        self._run_mode_context = None
+        self._pending_run_mode_id = ""
         index = self.agent_combo.findData(agent_id)
         if index >= 0 and index != self.agent_combo.currentIndex():
             self.agent_combo.blockSignals(True)
@@ -1563,6 +1568,10 @@ class MainWindow(QMainWindow):
         self.model_combo.clear()
         self.effort_combo.clear()
         self._reset_context_usage()
+        self._set_run_modes(
+            self.agent_manifest.run_modes,
+            self.agent_manifest.current_run_mode_id,
+        )
         self._apply_agent_capabilities()
 
     def _agent_availability_changed(self, availability: object) -> None:
@@ -1580,6 +1589,7 @@ class MainWindow(QMainWindow):
         if not isinstance(manifest, AgentManifest):
             return
         self.agent_manifest = manifest
+        self._set_run_modes(manifest.run_modes, manifest.current_run_mode_id)
         self._set_config_options(manifest.config_options)
         self._apply_agent_capabilities()
         self._update_slash_panel()
@@ -1631,9 +1641,17 @@ class MainWindow(QMainWindow):
         else:
             self.settings_button.setToolTip("Настройки текущего запроса")
         access_state = self._feature_state(FeatureId.ACCESS_MODES, capabilities.access_modes)
-        self.access_combo.setEnabled(access_state.enabled and self._editing_queued_message is None)
+        has_modes = any(
+            str(self.access_combo.itemData(index) or "")
+            for index in range(self.access_combo.count())
+        )
+        self.access_combo.setEnabled(
+            access_state.enabled and has_modes and self._editing_queued_message is None
+        )
         self.access_combo.setToolTip(
-            "Режим доступа для следующего запроса" if access_state.enabled else access_state.reason
+            self.access_combo.toolTip() or "Режим агента для следующего запроса"
+            if access_state.enabled and has_modes
+            else access_state.reason or f"{name} не объявил доступные режимы"
         )
         attachment_state = self._feature_state(FeatureId.INPUT_FILES, capabilities.attachments)
         self.attach_button.setEnabled(
@@ -1661,20 +1679,16 @@ class MainWindow(QMainWindow):
 
     def _load_settings(self) -> None:
         self._populate_agents()
+        self._set_run_modes(
+            self.agent_manifest.run_modes,
+            self.agent_manifest.current_run_mode_id,
+        )
         for path in self.settings.projects:
             self.project_combo.addItem(Path(path).name, path)
         saved_project = self.settings.get("last_project")
         index = self.project_combo.findData(saved_project)
         if index >= 0:
             self.project_combo.setCurrentIndex(index)
-        saved_selection = self._agent_setting("run_mode", self.settings.access_mode.value)
-        mode_index = self.access_combo.findData(saved_selection)
-        if mode_index >= 0:
-            self.access_combo.blockSignals(True)
-            self.access_combo.setCurrentIndex(mode_index)
-            self.access_combo.blockSignals(False)
-        if saved_selection == PLAN_MODE_VALUE:
-            self.access_combo.setToolTip("Режим планирования: анализ без изменения файлов")
         self._refresh_access_style()
         geometry, state = self.settings.restore_geometry()
         if not geometry.isEmpty():
@@ -1717,6 +1731,7 @@ class MainWindow(QMainWindow):
         self._clear_message_queue()
         self._reset_context_usage()
         self.service.set_project(path)
+        self.service.prepare_new_thread()
         self._clear_timeline("Выберите сохраненный чат или начните новый.")
 
     def _set_threads(self, threads: list[ThreadSummary]) -> None:
@@ -1762,6 +1777,8 @@ class MainWindow(QMainWindow):
                 if not self._switch_to_thread_project(cwd):
                     return
                 self.chat_title.setText(str(item.data(THREAD_TITLE_ROLE) or item.text().splitlines()[0]))
+                self._loading_existing_session = True
+                self._pending_run_mode_id = ""
                 self.service.open_thread(thread_id)
 
     def _switch_to_thread_project(self, cwd: str) -> bool:
@@ -1823,6 +1840,108 @@ class MainWindow(QMainWindow):
             self.model_combo.setCurrentIndex(index)
         self.model_combo.blockSignals(False)
         self._model_changed(self.model_combo.currentIndex())
+
+    @staticmethod
+    def _legacy_codex_run_modes() -> tuple[AgentRunMode, ...]:
+        """Compatibility modes for old services that only expose booleans."""
+        return (
+            AgentRunMode(
+                AccessMode.READ_ONLY.value,
+                AccessMode.READ_ONLY.title,
+                "Codex не сможет изменять файлы",
+                "safe",
+            ),
+            AgentRunMode(
+                AccessMode.WORKSPACE_WRITE.value,
+                AccessMode.WORKSPACE_WRITE.title,
+                "Изменения разрешены только внутри проекта",
+                "workspace",
+            ),
+            AgentRunMode(
+                AccessMode.FULL_ACCESS.value,
+                AccessMode.FULL_ACCESS.title,
+                "Команды выполняются без дополнительных подтверждений",
+                "danger",
+                True,
+            ),
+            AgentRunMode(
+                PLAN_MODE_VALUE,
+                "Режим планирования",
+                "Анализ без изменения файлов",
+                "plan",
+            ),
+        )
+
+    def _set_run_modes(self, modes: object, current_mode_id: str = "") -> None:
+        raw_modes = modes if isinstance(modes, (list, tuple)) else ()
+        rows = tuple(
+            mode for mode in raw_modes
+            if isinstance(mode, AgentRunMode)
+        )
+        if not rows and self._capabilities().access_modes:
+            rows = self._legacy_codex_run_modes()
+
+        default_id = current_mode_id or (
+            AccessMode.WORKSPACE_WRITE.value
+            if any(mode.id == AccessMode.WORKSPACE_WRITE.value for mode in rows)
+            else (rows[0].id if rows else "")
+        )
+        saved_id = self._agent_setting("run_mode", default_id)
+        supported_ids = {mode.id for mode in rows}
+        context = (
+            self._agent_id(),
+            str(getattr(self.service, "current_session_id", "") or ""),
+        )
+        new_context = bool(rows) and context != self._run_mode_context
+        if self._pending_run_mode_id in supported_ids:
+            selected_id = self._pending_run_mode_id
+        elif self._loading_existing_session and current_mode_id in supported_ids:
+            selected_id = current_mode_id
+        elif new_context and saved_id in supported_ids:
+            selected_id = saved_id
+        elif current_mode_id in supported_ids:
+            selected_id = current_mode_id
+        elif saved_id in supported_ids:
+            selected_id = saved_id
+        else:
+            selected_id = default_id if default_id in supported_ids else ""
+
+        self.access_combo.blockSignals(True)
+        self.access_combo.clear()
+        if rows:
+            for mode in rows:
+                self.access_combo.addItem(mode.title, mode.id)
+                index = self.access_combo.count() - 1
+                self.access_combo.setItemData(
+                    index,
+                    mode.description,
+                    Qt.ItemDataRole.ToolTipRole,
+                )
+            index = self.access_combo.findData(selected_id)
+            self.access_combo.setCurrentIndex(max(0, index))
+        else:
+            self.access_combo.addItem("Режим по умолчанию", "")
+        self.access_combo.blockSignals(False)
+
+        if (
+            rows
+            and new_context
+            and not self._loading_existing_session
+            and selected_id
+            and selected_id != current_mode_id
+            and not getattr(self.service, "current_run_id", "")
+        ):
+            setter = getattr(self.service, "set_run_mode", None)
+            if callable(setter):
+                setter(selected_id)
+        if rows:
+            self._run_mode_context = context
+        else:
+            self._run_mode_context = None
+        if current_mode_id and current_mode_id == self._pending_run_mode_id:
+            self._pending_run_mode_id = ""
+        self._loading_existing_session = False
+        self._refresh_access_style()
 
     def _set_config_options(self, options: object) -> None:
         if not isinstance(options, (list, tuple)):
@@ -1959,7 +2078,7 @@ class MainWindow(QMainWindow):
             unavailable.setEnabled(False)
         generic_menus: list[QMenu] = []
         for option in self.agent_config_options:
-            if option.category in {"model", "thought_level"}:
+            if option.category in {"model", "thought_level", "mode"}:
                 continue
             option_menu = QMenu(option.name, menu)
             menu.addMenu(option_menu)
@@ -2041,17 +2160,19 @@ class MainWindow(QMainWindow):
         self._note_next_request_setting()
 
     def _access_changed(self, _index: int) -> None:
-        selected = str(self.access_combo.currentData())
-        if selected == PLAN_MODE_VALUE:
-            self._set_agent_setting("run_mode", PLAN_MODE_VALUE)
-            self._refresh_access_style()
-            self._note_next_request_setting()
+        selected = str(self.access_combo.currentData() or "")
+        mode = next(
+            (item for item in self.agent_manifest.run_modes if item.id == selected),
+            None,
+        )
+        if mode is None:
+            mode = next(
+                (item for item in self._legacy_codex_run_modes() if item.id == selected),
+                None,
+            )
+        if mode is None:
             return
-        try:
-            mode = AccessMode(selected)
-        except ValueError:
-            return
-        if mode is AccessMode.FULL_ACCESS and not self._danger_acknowledged:
+        if mode.dangerous and not self._danger_acknowledged:
             answer = QMessageBox.warning(
                 self,
                 "Полный доступ",
@@ -2061,31 +2182,44 @@ class MainWindow(QMainWindow):
                 QMessageBox.StandardButton.No,
             )
             if answer != QMessageBox.StandardButton.Yes:
-                self.access_combo.setCurrentIndex(self.access_combo.findData(AccessMode.WORKSPACE_WRITE.value))
+                fallback = self.access_combo.findData(self.agent_manifest.current_run_mode_id)
+                if fallback < 0:
+                    fallback = self.access_combo.findData(AccessMode.WORKSPACE_WRITE.value)
+                self.access_combo.blockSignals(True)
+                self.access_combo.setCurrentIndex(max(0, fallback))
+                self.access_combo.blockSignals(False)
+                self._refresh_access_style()
                 return
             self._danger_acknowledged = True
-        self._set_agent_setting("access_mode", mode.value)
-        self._set_agent_setting("run_mode", mode.value)
+        self._set_agent_setting("run_mode", mode.id)
+        if mode.id in {item.value for item in AccessMode}:
+            self._set_agent_setting("access_mode", mode.id)
+        if getattr(self.service, "current_run_id", ""):
+            self._pending_run_mode_id = mode.id
+        else:
+            self._pending_run_mode_id = ""
+            setter = getattr(self.service, "set_run_mode", None)
+            if callable(setter):
+                setter(mode.id)
         self._refresh_access_style()
         self._note_next_request_setting()
 
     def _refresh_access_style(self) -> None:
-        selected = str(self.access_combo.currentData() or AccessMode.WORKSPACE_WRITE.value)
-        mode = {
-            AccessMode.READ_ONLY.value: "safe",
-            AccessMode.WORKSPACE_WRITE.value: "workspace",
-            AccessMode.FULL_ACCESS.value: "danger",
-            PLAN_MODE_VALUE: "plan",
-        }.get(selected, "workspace")
-        descriptions = {
-            AccessMode.READ_ONLY.value: f"Только чтение: {self._agent_name()} не сможет изменять файлы",
-            AccessMode.WORKSPACE_WRITE.value: "Рабочая папка: изменения разрешены только внутри проекта",
-            AccessMode.FULL_ACCESS.value: "Полный доступ: команды выполняются без дополнительных подтверждений",
-            PLAN_MODE_VALUE: "Режим планирования: анализ без изменения файлов",
-        }
+        selected = str(self.access_combo.currentData() or "")
+        descriptor = next(
+            (item for item in self.agent_manifest.run_modes if item.id == selected),
+            None,
+        )
+        if descriptor is None:
+            descriptor = next(
+                (item for item in self._legacy_codex_run_modes() if item.id == selected),
+                None,
+            )
+        tone = descriptor.tone if descriptor is not None else "neutral"
+        description = descriptor.description if descriptor is not None else ""
         suffix = "\nПрименится к следующему сообщению" if self._turn_active else ""
-        self.access_combo.setToolTip(descriptions.get(selected, "") + suffix)
-        self.access_combo.setProperty("mode", mode)
+        self.access_combo.setToolTip(description + suffix)
+        self.access_combo.setProperty("mode", tone)
         self.access_combo.setProperty("nextTurn", self._turn_active)
         self.access_combo.style().unpolish(self.access_combo)
         self.access_combo.style().polish(self.access_combo)
@@ -2377,10 +2511,19 @@ class MainWindow(QMainWindow):
         self.composer.clear()
         self.attachments.clear()
         self._render_attachments()
-        selected_mode = str(self.access_combo.currentData())
+        selected_mode = str(self.access_combo.currentData() or "")
+        run_mode = next(
+            (item for item in self.agent_manifest.run_modes if item.id == selected_mode),
+            None,
+        )
+        if run_mode is None:
+            run_mode = next(
+                (item for item in self._legacy_codex_run_modes() if item.id == selected_mode),
+                None,
+            )
         collaboration_mode = (
             PLAN_MODE_VALUE
-            if force_plan or selected_mode == PLAN_MODE_VALUE
+            if force_plan or (run_mode is not None and run_mode.tone == "plan")
             else None
         )
         if collaboration_mode:
@@ -2399,6 +2542,7 @@ class MainWindow(QMainWindow):
             collaboration_mode,
             queue_syntax,
             self._current_agent_config(),
+            selected_mode,
         )
         if self._turn_active or self._queue_action_pending:
             self._message_queue.append(message)
@@ -2441,12 +2585,13 @@ class MainWindow(QMainWindow):
                 ] = message.effort
             submit_prompt(
                 AgentPrompt(
-                    message.text,
-                    tuple(message.attachments),
-                    getattr(self.service, "current_project", ""),
-                    config,
-                    message.collaboration_mode or "",
-                    message.access_mode,
+                    text=message.text,
+                    attachments=tuple(message.attachments),
+                    working_directory=getattr(self.service, "current_project", ""),
+                    config=config,
+                    mode=message.collaboration_mode or "",
+                    access_mode=message.access_mode,
+                    run_mode_id=message.run_mode_id,
                 )
             )
         else:
@@ -2722,8 +2867,10 @@ class MainWindow(QMainWindow):
         return next((item for item in self.models if item.id == model_id), None)
 
     def _render_thread(self, thread: dict[str, Any]) -> None:
-        self._clear_timeline()
         items, omitted_turns, omitted_items = recent_thread_items(thread)
+        self._clear_timeline(
+            "Новый чат готов. Опишите задачу ниже." if not items else ""
+        )
         if omitted_turns or omitted_items:
             details: list[str] = []
             if omitted_turns:
@@ -2913,10 +3060,12 @@ class MainWindow(QMainWindow):
                 if subtype == "webSearch" or kind == "webSearch"
                 else "ИИ использует инструмент"
             )
+            advertised_kind = "" if subtype == "acp_tool_call" else subtype
             title = str(
                 item.get("tool")
                 or item.get("query")
-                or subtype
+                or advertised_kind
+                or item.get("title")
                 or kind
             )
             self._activity(item_id, title, self._compact_item(item))
@@ -3639,6 +3788,7 @@ class MainWindow(QMainWindow):
             self.effort_combo.currentData(),
             AccessMode.WORKSPACE_WRITE,
             None,
+            run_mode_id=AccessMode.WORKSPACE_WRITE.value,
         )
         if self._turn_active:
             self._message_queue.insert(0, message)

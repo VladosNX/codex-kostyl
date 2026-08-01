@@ -10,10 +10,13 @@ from codex_gui.agents.base import (
     AgentCapabilities,
     AgentConfigOption,
     AgentDescriptor,
+    AgentManifest,
     AgentPrompt,
+    AgentRunMode,
     ConfigOptionValue,
     FeatureId,
     FeatureState,
+    FeatureSupport,
 )
 from codex_gui.main_window import MainWindow, QueuedCommand
 from codex_gui.models import PLAN_MODE_VALUE, AccessMode, Attachment, ModelInfo, ThreadSummary
@@ -126,6 +129,16 @@ def test_agent_selector_is_visible_with_only_codex(qtbot) -> None:
     assert window.agent_combo.currentData() == "codex"
 
 
+def test_empty_loaded_session_keeps_new_chat_starter(qtbot) -> None:
+    window, _service = make_window(qtbot)
+
+    window._render_thread({"id": "new-session", "turns": []})
+
+    empty = window.findChild(QWidget, "emptyHint")
+    assert empty is not None
+    assert "Чем займёмся?" in empty.findChild(QLabel, "emptyTitle").text()
+
+
 def test_unsupported_agent_features_stay_visible_but_disabled(qtbot) -> None:
     window, service = make_window(qtbot)
     service.descriptor = AgentDescriptor("minimal", "Minimal", "minimal")
@@ -140,6 +153,35 @@ def test_unsupported_agent_features_stay_visible_but_disabled(qtbot) -> None:
     assert window.access_combo.isEnabled() is False
     assert window.attach_button.isHidden() is False
     assert window.attach_button.isEnabled() is False
+
+
+def test_agent_run_modes_replace_codex_access_presets(qtbot) -> None:
+    settings = FakeSettings()
+    window, _service = make_window(qtbot, settings)
+    window._manifest_updated(
+        AgentManifest(
+            features={FeatureId.ACCESS_MODES.value: FeatureSupport(True)},
+            run_modes=(
+                AgentRunMode("build", "build", "Uses configured permissions"),
+                AgentRunMode("plan", "plan", "Disallows edit tools"),
+            ),
+            current_run_mode_id="build",
+        )
+    )
+
+    assert [window.access_combo.itemData(index) for index in range(window.access_combo.count())] == [
+        "build",
+        "plan",
+    ]
+    window.access_combo.setCurrentIndex(window.access_combo.findData("plan"))
+    window._turn_state("inProgress")
+    window.composer.setPlainText("Составь план")
+    window._send()
+
+    queued = window._message_queue[0]
+    assert queued.run_mode_id == "plan"
+    assert queued.collaboration_mode is None
+    assert settings.values["run_mode"] == "plan"
 
 
 def test_temporarily_disabled_feature_shows_driver_reason(qtbot) -> None:
@@ -330,6 +372,38 @@ def test_thinking_label_tracks_current_agent_activity(qtbot) -> None:
 
     window._agent_delta("answer", "Готово")
     assert "ИИ пишет ответ" in window._thinking_indicator.label.text()
+
+
+def test_acp_tool_call_uses_title_when_kind_is_missing(qtbot) -> None:
+    window, _service = make_window(qtbot)
+
+    window._upsert_item(
+        {
+            "id": "tool-without-kind",
+            "kind": "tool_call",
+            "subtype": "acp_tool_call",
+            "title": "Read README.md",
+        },
+        False,
+    )
+
+    assert window.cards["tool-without-kind"].toggle.text() == "Read README.md"
+
+
+def test_acp_tool_call_keeps_kind_when_title_is_also_present(qtbot) -> None:
+    window, _service = make_window(qtbot)
+
+    window._upsert_item(
+        {
+            "id": "tool-with-kind",
+            "kind": "tool_call",
+            "subtype": "execute",
+            "title": "Run pytest",
+        },
+        False,
+    )
+
+    assert window.cards["tool-with-kind"].toggle.text() == "execute"
 
 
 def test_permission_prompt_shows_scope_and_preserves_response_context(qtbot) -> None:

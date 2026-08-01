@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
 
@@ -72,6 +72,17 @@ class AgentConfigOption:
 
 
 @dataclass(slots=True, frozen=True)
+class AgentRunMode:
+    """A driver-owned mode that can be selected for an agent run/session."""
+
+    id: str
+    title: str
+    description: str = ""
+    tone: str = "neutral"
+    dangerous: bool = False
+
+
+@dataclass(slots=True, frozen=True)
 class AuthMethod:
     id: str
     name: str
@@ -87,6 +98,8 @@ class AgentManifest:
     auth_methods: tuple[AuthMethod, ...] = ()
     implementation_name: str = ""
     implementation_version: str = ""
+    run_modes: tuple[AgentRunMode, ...] = ()
+    current_run_mode_id: str = ""
 
     def support(self, feature: FeatureId | str) -> FeatureSupport:
         return self.features.get(
@@ -134,6 +147,7 @@ class AgentPrompt:
     config: dict[str, str | bool] = field(default_factory=dict)
     mode: str = ""
     access_mode: Any = None
+    run_mode_id: str = ""
 
 
 @dataclass(slots=True, frozen=True)
@@ -146,6 +160,7 @@ class AgentState:
     account_summary: dict[str, Any] | None = None
     context_usage: dict[str, Any] | None = None
     quota_usage: dict[str, Any] | None = None
+    current_run_mode_id: str = ""
 
 
 @dataclass(slots=True, frozen=True)
@@ -307,6 +322,7 @@ class AgentDriver(QObject):
         self.current_project = ""
         self.current_session_id = ""
         self.current_run_id = ""
+        self.current_run_mode_id = manifest.current_run_mode_id
         self.connected = False
         self.account: dict[str, Any] | None = None
 
@@ -338,6 +354,16 @@ class AgentDriver(QObject):
 
     def feature_override(self, _feature: str) -> FeatureState | None:
         return None
+
+    def set_run_mode(self, mode_id: str) -> None:
+        if not any(mode.id == mode_id for mode in self.manifest.run_modes):
+            self.errorOccurred.emit(
+                f"{self.descriptor.display_name} не поддерживает режим {mode_id}"
+            )
+            return
+        self.current_run_mode_id = mode_id
+        self.manifest = replace(self.manifest, current_run_mode_id=mode_id)
+        self.manifestUpdated.emit(self.manifest)
 
 
 def _manifest_from_legacy(capabilities: AgentCapabilities) -> AgentManifest:

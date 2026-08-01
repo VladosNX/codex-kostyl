@@ -117,6 +117,19 @@ def test_unavailable_agent_does_not_replace_running_driver(qtbot) -> None:
     assert manager.connected is True
 
 
+def test_prepare_new_session_before_agent_activation_is_silent(qtbot) -> None:
+    registry = AgentRegistry()
+    manager = AgentManager(registry, MemorySettings())
+    errors: list[str] = []
+    manager.errorOccurred.connect(errors.append)
+
+    manager.set_project("/repo")
+    manager.prepare_new_session()
+
+    assert errors == []
+    assert manager.current_project == "/repo"
+
+
 def test_invalid_executable_does_not_stop_or_replace_running_driver(qtbot) -> None:
     registry = AgentRegistry()
     created: list[FakeDriver] = []
@@ -455,6 +468,96 @@ def test_acp_uses_advertised_config_ids_and_session_modes(qtbot) -> None:
     mode_request = transport.sent[-1]
     assert mode_request["method"] == "session/set_mode"
     assert mode_request["params"]["modeId"] == "plan"
+
+
+def test_acp_prefers_config_mode_and_exposes_agent_run_modes(qtbot) -> None:
+    driver, transport = make_acp_driver()
+    initialize_acp(driver, transport)
+    driver.current_project = "/repo"
+    driver.current_session_id = "s1"
+    driver._apply_config_options(
+        [
+            {
+                "id": "mode",
+                "name": "Session Mode",
+                "category": "mode",
+                "currentValue": "build",
+                "options": [
+                    {
+                        "value": "build",
+                        "name": "build",
+                        "description": "Uses configured permissions",
+                    },
+                    {
+                        "value": "plan",
+                        "name": "plan",
+                        "description": "Disallows edit tools",
+                    },
+                ],
+            }
+        ]
+    )
+    driver._apply_modes(
+        {
+            "currentModeId": "legacy",
+            "availableModes": [{"id": "legacy", "name": "Legacy"}],
+        }
+    )
+
+    assert [option.id for option in driver.config_options] == ["mode"]
+    assert [mode.id for mode in driver.manifest.run_modes] == ["build", "plan"]
+    assert driver.manifest.current_run_mode_id == "build"
+    assert driver.manifest.support(FeatureId.ACCESS_MODES).supported is True
+
+    driver.set_run_mode("plan")
+
+    request = transport.sent[-1]
+    assert request["method"] == "session/set_config_option"
+    assert request["params"] == {
+        "sessionId": "s1",
+        "configId": "mode",
+        "value": "plan",
+    }
+
+
+def test_acp_prepares_session_to_discover_modes_before_first_prompt(qtbot) -> None:
+    driver, transport = make_acp_driver()
+    initialize_acp(driver, transport)
+    driver.set_project("/repo")
+
+    driver.prepare_new_session()
+
+    request = transport.sent[-1]
+    assert request["method"] == "session/new"
+    transport.messageReceived.emit(
+        {
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {
+                "sessionId": "new-session",
+                "configOptions": [
+                    {
+                        "id": "mode",
+                        "name": "Session Mode",
+                        "category": "mode",
+                        "currentValue": "build",
+                        "options": [
+                            {"value": "build", "name": "build"},
+                            {"value": "plan", "name": "plan"},
+                        ],
+                    }
+                ],
+            },
+        }
+    )
+
+    assert driver.current_session_id == "new-session"
+    assert [mode.id for mode in driver.manifest.run_modes] == ["build", "plan"]
+    before = len([item for item in transport.sent if item.get("method") == "session/new"])
+    driver.submit_prompt(AgentPrompt("hello", run_mode_id="plan"))
+    after = len([item for item in transport.sent if item.get("method") == "session/new"])
+    assert after == before
+    assert transport.sent[-1]["method"] == "session/set_config_option"
 
 
 def test_custom_agent_profiles_round_trip_through_settings(monkeypatch, tmp_path) -> None:
