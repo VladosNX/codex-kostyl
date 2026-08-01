@@ -395,7 +395,23 @@ def test_fork_switches_after_loading_copy_and_refreshes_history(qtbot) -> None:
     }
     rpc.callbacks[1]({"thread": copied}, None)
 
-    assert loaded == [copied]
+    assert loaded == [
+        {
+            "id": "thr_copy",
+            "turns": [
+                {
+                    "items": [
+                        {
+                            "id": "old",
+                            "kind": "assistant_message",
+                            "subtype": "agentMessage",
+                            "text": "copy",
+                        }
+                    ]
+                }
+            ],
+        }
+    ]
     assert switched == [True]
     assert rpc.calls[2][0] == "thread/list"
     assert all(method not in {"thread/archive", "thread/delete"} for method, _params in rpc.calls)

@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "codex-kostyl"
 version = "0.1.0"
-description = "A native Linux GUI for Codex CLI"
+description = "A cross-platform desktop GUI for local AI coding agents"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }

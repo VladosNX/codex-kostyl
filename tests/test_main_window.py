@@ -2,10 +2,19 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QObject, Qt, Signal
+from PySide6.QtCore import QByteArray, QObject, QProcess, Qt, Signal
 from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import QLabel, QMessageBox, QPushButton, QWidget
 
+from codex_gui.agents.base import (
+    AgentCapabilities,
+    AgentConfigOption,
+    AgentDescriptor,
+    AgentPrompt,
+    ConfigOptionValue,
+    FeatureId,
+    FeatureState,
+)
 from codex_gui.main_window import MainWindow, QueuedCommand
 from codex_gui.models import PLAN_MODE_VALUE, AccessMode, Attachment, ModelInfo, ThreadSummary
 
@@ -107,6 +116,108 @@ def make_window(qtbot, settings: FakeSettings | None = None) -> tuple[MainWindow
     window._show_desktop_notification = lambda *_args: None  # type: ignore[method-assign]
     qtbot.addWidget(window)
     return window, service
+
+
+def test_agent_selector_is_visible_with_only_codex(qtbot) -> None:
+    window, _service = make_window(qtbot)
+
+    assert window.agent_combo.isHidden() is False
+    assert window.agent_combo.count() == 1
+    assert window.agent_combo.currentData() == "codex"
+
+
+def test_unsupported_agent_features_stay_visible_but_disabled(qtbot) -> None:
+    window, service = make_window(qtbot)
+    service.descriptor = AgentDescriptor("minimal", "Minimal", "minimal")
+    service.capabilities = AgentCapabilities(session_history=True)
+
+    window._apply_agent_capabilities()
+
+    assert window.settings_button.isHidden() is False
+    assert window.settings_button.isEnabled() is False
+    assert "не поддерживаются агентом Minimal" in window.settings_button.toolTip()
+    assert window.access_combo.isHidden() is False
+    assert window.access_combo.isEnabled() is False
+    assert window.attach_button.isHidden() is False
+    assert window.attach_button.isEnabled() is False
+
+
+def test_temporarily_disabled_feature_shows_driver_reason(qtbot) -> None:
+    window, service = make_window(qtbot)
+    service.descriptor = AgentDescriptor("limited", "Limited", "limited")
+
+    def feature_state(feature: FeatureId) -> FeatureState:
+        if feature is FeatureId.SESSION_COMPACT:
+            return FeatureState(True, False, "Сжатие доступно после первого ответа")
+        return FeatureState(False, False, "Агент не передаёт эти данные")
+
+    service.feature_state = feature_state  # type: ignore[attr-defined]
+    window._apply_agent_capabilities()
+    window.composer.setPlainText("/")
+
+    compact = window.slash_panel.list.item(0)
+    assert "Сжатие доступно после первого ответа" in compact.text()
+    assert compact.flags() & Qt.ItemFlag.ItemIsEnabled == Qt.ItemFlag.NoItemFlags
+    assert window.weekly_limit.isHidden() is False
+    assert window.weekly_limit_label.text() == "Лимит —"
+    assert window.context_usage_widget.isHidden() is False
+    assert window.context_usage_label.text() == "Контекст —"
+
+
+def test_generic_config_categories_keep_agent_specific_ids(qtbot) -> None:
+    window, service = make_window(qtbot)
+    prompts: list[AgentPrompt] = []
+    service.submit_prompt = prompts.append  # type: ignore[attr-defined]
+    window._set_config_options(
+        (
+            AgentConfigOption(
+                "vendor.model.choice",
+                "Model",
+                "model",
+                current_value="small",
+                values=(
+                    ConfigOptionValue("small", "Small"),
+                    ConfigOptionValue("large", "Large"),
+                ),
+            ),
+            AgentConfigOption(
+                "vendor.reasoning.level",
+                "Reasoning",
+                "thought_level",
+                current_value="low",
+                values=(
+                    ConfigOptionValue("low", "Low"),
+                    ConfigOptionValue("high", "High"),
+                ),
+            ),
+        )
+    )
+    window.model_combo.setCurrentIndex(window.model_combo.findData("large"))
+    window.effort_combo.setCurrentIndex(window.effort_combo.findData("high"))
+    window.composer.setPlainText("Проверь проект")
+
+    window._send()
+
+    assert prompts[-1].config["vendor.model.choice"] == "large"
+    assert prompts[-1].config["vendor.reasoning.level"] == "high"
+    assert "model" not in prompts[-1].config
+    assert "thought_level" not in prompts[-1].config
+
+
+def test_macos_notification_does_not_call_linux_notify_send(qtbot, monkeypatch) -> None:
+    window, _service = make_window(qtbot)
+    window._tray_available = False
+    detached: list[tuple] = []
+    monkeypatch.setattr("codex_gui.main_window.sys.platform", "darwin")
+    monkeypatch.setattr(
+        QProcess,
+        "startDetached",
+        lambda *args: detached.append(args),
+    )
+
+    window._show_desktop_notification("Title", "Message")
+
+    assert detached == []
 
 
 def test_message_is_queued_during_active_turn_and_sent_after_completion(qtbot) -> None:

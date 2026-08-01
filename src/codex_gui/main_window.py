@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import mimetypes
+import re
+import shlex
+import shutil
+import sys
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
@@ -30,6 +34,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFrame,
+    QFormLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -51,9 +56,22 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .agents.base import (
+    AgentAvailability,
+    AgentCapabilities,
+    AgentConfigOption,
+    AgentDescriptor,
+    AgentManifest,
+    AgentProfile,
+    AgentPrompt,
+    AuthMethod,
+    FeatureId,
+    FeatureState,
+    PermissionOption,
+    PermissionRequest,
+)
 from .models import PLAN_MODE_VALUE, AccessMode, Attachment, ModelInfo, ThreadSummary, weekly_limit_from_payload
 from .rendering import MarkdownRenderer, plain_pre
-from .service import CodexService
 from .settings import AppSettings
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -107,6 +125,7 @@ class QueuedMessage:
     access_mode: AccessMode
     collaboration_mode: str | None
     queue_syntax: str | None = None
+    config: dict[str, str | bool] = dataclass_field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -126,6 +145,7 @@ class ApprovalPrompt:
     params: dict[str, Any]
     title: str
     detail: str
+    options: tuple[Any, ...] = ()
 
 
 @dataclass(slots=True, frozen=True)
@@ -670,7 +690,7 @@ class InlineUserInputCard(QFrame):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 13, 14, 13)
         layout.setSpacing(9)
-        self.title = QLabel("Codex запрашивает ответ")
+        self.title = QLabel("Агент запрашивает ответ")
         self.title.setObjectName("questionTitle")
         layout.addWidget(self.title)
         self.questions_layout = QVBoxLayout()
@@ -698,7 +718,7 @@ class InlineUserInputCard(QFrame):
         if len(questions) == 1 and questions[0].get("header"):
             self.title.setText(str(questions[0]["header"]))
         else:
-            self.title.setText("Codex запрашивает ответы")
+            self.title.setText("Агент запрашивает ответы")
         for number, question in enumerate(questions, start=1):
             frame = QWidget()
             frame_layout = QVBoxLayout(frame)
@@ -825,40 +845,57 @@ class InlineApprovalCard(QFrame):
         self.detail.setWordWrap(True)
         layout.addWidget(self.detail)
 
-        actions = QHBoxLayout()
-        self.stop_button = QPushButton("Остановить выполнение")
-        self.stop_button.setObjectName("approvalDangerButton")
-        self.stop_button.setToolTip("Остановить текущий ход и отклонить запрос")
-        self.stop_button.clicked.connect(
-            lambda _checked=False: self.decisionSelected.emit("cancel")
-        )
-        actions.addWidget(self.stop_button)
-        actions.addStretch(1)
-        for text, decision, object_name in (
-            ("Запретить", "decline", "approvalSecondaryButton"),
-            ("Разрешить до закрытия чата", "acceptForSession", "approvalSecondaryButton"),
-            ("Разрешить один раз", "accept", "approvalPrimaryButton"),
-        ):
-            button = QPushButton(text)
-            button.setObjectName(object_name)
-            button.setAccessibleName(text)
-            button.clicked.connect(
-                lambda _checked=False, value=decision: self.decisionSelected.emit(value)
-            )
-            actions.addWidget(button)
-        layout.addLayout(actions)
+        self.actions = QHBoxLayout()
+        layout.addLayout(self.actions)
 
-    def set_request(self, title: str, detail: str) -> None:
+    def set_request(self, title: str, detail: str, options: tuple[Any, ...] = ()) -> None:
         self.title.setText(title)
         self.detail.setText(detail.strip())
+        while self.actions.count():
+            item = self.actions.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        rows = options or (
+            PermissionOption("decline", "Запретить", "reject"),
+            PermissionOption(
+                "acceptForSession",
+                "Разрешить до закрытия чата",
+                "allow_always",
+            ),
+            PermissionOption("accept", "Разрешить один раз", "allow_once"),
+        )
+        stop_button = QPushButton("Остановить выполнение")
+        stop_button.setObjectName("approvalDangerButton")
+        stop_button.setToolTip("Остановить текущий ход и отклонить запрос")
+        stop_button.clicked.connect(
+            lambda _checked=False: self.decisionSelected.emit("cancel")
+        )
+        self.actions.addWidget(stop_button)
+        self.actions.addStretch(1)
+        for option in rows:
+            option_id = str(getattr(option, "id", ""))
+            label = str(getattr(option, "label", option_id))
+            kind = str(getattr(option, "kind", ""))
+            object_name = (
+                "approvalPrimaryButton"
+                if kind in {"allow_once", "accept"} or option_id == "accept"
+                else "approvalSecondaryButton"
+            )
+            button = QPushButton(label)
+            button.setObjectName(object_name)
+            button.setAccessibleName(label)
+            button.clicked.connect(
+                lambda _checked=False, value=option_id: self.decisionSelected.emit(value)
+            )
+            self.actions.addWidget(button)
 
 
 class ApiKeyDialog(QDialog):
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, agent_name: str = "Codex", parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Вход с API-ключом")
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Ключ передается Codex и не сохраняется приложением."))
+        layout.addWidget(QLabel(f"Ключ передаётся {agent_name} и не сохраняется приложением."))
         self.input = QLineEdit()
         self.input.setEchoMode(QLineEdit.EchoMode.Password)
         self.input.setPlaceholderText("sk-…")
@@ -869,13 +906,83 @@ class ApiKeyDialog(QDialog):
         layout.addWidget(buttons)
 
 
+class AcpProfileDialog(QDialog):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Добавить ACP-агента")
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText("Например, Goose")
+        form.addRow("Название", self.name_input)
+        executable_row = QHBoxLayout()
+        self.executable_input = QLineEdit()
+        self.executable_input.setPlaceholderText("/путь/к/agent")
+        browse = QPushButton("Обзор…")
+        browse.clicked.connect(self._browse)
+        executable_row.addWidget(self.executable_input, 1)
+        executable_row.addWidget(browse)
+        form.addRow("Исполняемый файл", executable_row)
+        self.arguments_input = QLineEdit()
+        self.arguments_input.setPlaceholderText("Аргументы запуска, если нужны")
+        form.addRow("Аргументы", self.arguments_input)
+        layout.addLayout(form)
+        self.error_label = QLabel()
+        self.error_label.setObjectName("questionError")
+        self.error_label.setVisible(False)
+        layout.addWidget(self.error_label)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._accept_if_valid)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _browse(self) -> None:
+        path, _filter = QFileDialog.getOpenFileName(self, "Исполняемый файл ACP-агента")
+        if path:
+            self.executable_input.setText(path)
+
+    def _accept_if_valid(self) -> None:
+        if not self.name_input.text().strip() or not self.executable_input.text().strip():
+            self.error_label.setText("Укажите название и исполняемый файл.")
+            self.error_label.setVisible(True)
+            return
+        try:
+            shlex.split(self.arguments_input.text())
+        except ValueError as exc:
+            self.error_label.setText(f"Некорректные аргументы: {exc}")
+            self.error_label.setVisible(True)
+            return
+        self.accept()
+
+    def profile(self, existing_ids: set[str]) -> AgentProfile:
+        name = self.name_input.text().strip()
+        base = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "acp-agent"
+        profile_id = base
+        suffix = 2
+        while profile_id in existing_ids:
+            profile_id = f"{base}-{suffix}"
+            suffix += 1
+        return AgentProfile(
+            profile_id,
+            "acp",
+            name,
+            self.executable_input.text().strip(),
+            tuple(shlex.split(self.arguments_input.text())),
+            "ACP v1 через локальный stdio",
+        )
+
+
 class MainWindow(QMainWindow):
-    def __init__(self, service: CodexService, settings: AppSettings, stop_server: Any) -> None:
+    def __init__(self, service: Any, settings: AppSettings, stop_server: Any) -> None:
         super().__init__()
         self.service = service
         self.settings = settings
         self.stop_server = stop_server
         self.models: list[ModelInfo] = []
+        self.agent_config_options: tuple[AgentConfigOption, ...] = ()
+        self.agent_manifest = AgentManifest()
         self.attachments: list[Attachment] = []
         self.cards: dict[str, MessageCard | ActivityCard] = {}
         self._execution_plan_cards: dict[str, ExecutionPlanCard] = {}
@@ -905,7 +1012,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._build_notifications()
         self._connect_service()
-        self._clear_timeline("Добавьте рабочую папку, чтобы начать работу с Codex.")
+        self._clear_timeline("Добавьте рабочую папку, чтобы начать работу с AI-агентом.")
         self._load_settings()
 
     def _build_ui(self) -> None:
@@ -923,11 +1030,11 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.main_splitter)
         self.sidebar_shortcut = QShortcut(QKeySequence("Ctrl+B"), self)
         self.sidebar_shortcut.activated.connect(self._toggle_sidebar)
-        self.statusBar().showMessage("Запуск Codex app-server…")
+        self.statusBar().showMessage("Запуск AI-агента…")
 
     def _build_notifications(self) -> None:
         self.tray_icon = QSystemTrayIcon(self.windowIcon(), self)
-        self.tray_icon.setToolTip("Codex")
+        self.tray_icon.setToolTip("Codex Kostyl")
         self.tray_icon.messageClicked.connect(self._show_from_notification)
         self.tray_icon.activated.connect(
             lambda _reason: self._show_from_notification()
@@ -949,7 +1056,7 @@ class MainWindow(QMainWindow):
                 QSystemTrayIcon.MessageIcon.Information,
                 7000,
             )
-        else:
+        elif sys.platform.startswith("linux") and shutil.which("notify-send"):
             QProcess.startDetached(
                 "notify-send",
                 ["--app-name=Codex Kostyl", title, message],
@@ -1056,6 +1163,12 @@ class MainWindow(QMainWindow):
         titles.addWidget(self.chat_context)
         topbar_layout.addLayout(titles)
         topbar_layout.addStretch(1)
+        self.agent_combo = QComboBox()
+        self.agent_combo.setObjectName("optionCombo")
+        self.agent_combo.setMinimumWidth(110)
+        self.agent_combo.setAccessibleName("AI-агент")
+        self.agent_combo.setToolTip("Активный AI-агент")
+        topbar_layout.addWidget(self.agent_combo)
         self.header_status = QLabel("●  Готов")
         self.header_status.setObjectName("readyStatus")
         topbar_layout.addWidget(self.header_status)
@@ -1064,7 +1177,7 @@ class MainWindow(QMainWindow):
         self.model_combo = QComboBox(panel)
         self.model_combo.setObjectName("optionCombo")
         self.model_combo.setMinimumWidth(160)
-        self.model_combo.setAccessibleName("Модель Codex")
+        self.model_combo.setAccessibleName("Модель AI-агента")
         self.model_combo.setVisible(False)
         self.effort_combo = QComboBox(panel)
         self.effort_combo.setObjectName("optionCombo")
@@ -1338,10 +1451,10 @@ class MainWindow(QMainWindow):
         composer_area_layout.addWidget(composer_panel)
         shell_layout.addWidget(composer_area)
 
-        hint = QLabel("Codex может ошибаться. Проверяйте команды и изменения файлов.")
-        hint.setObjectName("composerHint")
-        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        shell_layout.addWidget(hint)
+        self.composer_hint = QLabel("Codex может ошибаться. Проверяйте команды и изменения файлов.")
+        self.composer_hint.setObjectName("composerHint")
+        self.composer_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        shell_layout.addWidget(self.composer_hint)
         layout.addWidget(composer_shell)
 
         attach.clicked.connect(self._choose_attachments)
@@ -1357,17 +1470,25 @@ class MainWindow(QMainWindow):
         self.composer.slashDismiss.connect(self._dismiss_slash_panel)
         self.slash_panel.commandActivated.connect(self._activate_slash_command)
         self.send_button.clicked.connect(self._send)
-        self.stop_button.clicked.connect(self.service.interrupt)
+        cancel_run = getattr(self.service, "cancel_run", None)
+        self.stop_button.clicked.connect(
+            cancel_run if callable(cancel_run) else self.service.interrupt
+        )
         self.queue_resume_button.clicked.connect(self._resume_queue)
         self.queue_clear_button.clicked.connect(self._clear_message_queue)
         self.model_combo.currentIndexChanged.connect(self._model_changed)
         self.effort_combo.currentIndexChanged.connect(self._effort_changed)
         self.access_combo.currentIndexChanged.connect(self._access_changed)
         self.settings_button.clicked.connect(self._show_request_settings_menu)
+        self.agent_combo.currentIndexChanged.connect(self._agent_changed)
         return panel
 
     def _connect_service(self) -> None:
-        self.service.ready.connect(lambda: self.statusBar().showMessage("Codex подключен", 3000))
+        self.service.ready.connect(
+            lambda: self.statusBar().showMessage(
+                f"{self._agent_name()} подключен", 3000
+            )
+        )
         self.service.modelsUpdated.connect(self._set_models)
         self.service.accountUpdated.connect(self._set_account)
         self.service.rateLimitsUpdated.connect(self._set_rate_limits)
@@ -1383,21 +1504,223 @@ class MainWindow(QMainWindow):
         self.service.turnStateChanged.connect(self._turn_state)
         self.service.errorOccurred.connect(self._show_error)
         self.service.loginStarted.connect(self._login_started)
-        self.service.approvalRequested.connect(self._approval_requested)
+        permission_requested = getattr(self.service, "permissionRequested", None)
+        if permission_requested is not None:
+            permission_requested.connect(self._permission_requested)
+        else:
+            self.service.approvalRequested.connect(self._approval_requested)
         self.service.userInputRequested.connect(self._user_input_requested)
         self.service.serverRequestResolved.connect(self._server_request_resolved)
         current_thread_changed = getattr(self.service, "currentThreadChanged", None)
         if current_thread_changed is not None:
             current_thread_changed.connect(lambda _thread_id: self._update_slash_panel())
+        agents_changed = getattr(self.service, "agentsChanged", None)
+        if agents_changed is not None:
+            agents_changed.connect(self._populate_agents)
+        active_agent_changed = getattr(self.service, "activeAgentChanged", None)
+        if active_agent_changed is not None:
+            active_agent_changed.connect(self._active_agent_changed)
+        availability_changed = getattr(self.service, "availabilityChanged", None)
+        if availability_changed is not None:
+            availability_changed.connect(self._agent_availability_changed)
+        manifest_updated = getattr(self.service, "manifestUpdated", None)
+        if manifest_updated is not None:
+            manifest_updated.connect(self._manifest_updated)
+        config_updated = getattr(self.service, "configOptionsUpdated", None)
+        if config_updated is not None:
+            config_updated.connect(self._set_config_options)
+        feature_states_changed = getattr(self.service, "featureStatesChanged", None)
+        if feature_states_changed is not None:
+            feature_states_changed.connect(lambda _states: self._apply_agent_capabilities())
+
+    def _agent_id(self) -> str:
+        return str(getattr(self.service, "active_agent_id", "") or "codex")
+
+    def _agent_name(self) -> str:
+        descriptor = getattr(self.service, "descriptor", None)
+        return str(getattr(descriptor, "display_name", "") or "Codex")
+
+    def _agent_setting(self, key: str, default: str = "") -> str:
+        getter = getattr(self.settings, "agent_get", None)
+        if callable(getter):
+            return str(getter(self._agent_id(), key, default))
+        return self.settings.get(key, default)
+
+    def _set_agent_setting(self, key: str, value: object) -> None:
+        setter = getattr(self.settings, "agent_set", None)
+        if callable(setter):
+            setter(self._agent_id(), key, value)
+        else:
+            self.settings.set(key, value)
+
+    def _populate_agents(self, descriptors: object | None = None) -> None:
+        rows = descriptors
+        if rows is None:
+            rows = getattr(self.service, "available_agents", None)
+        agents = [item for item in (rows or []) if isinstance(item, AgentDescriptor)]
+        if not agents:
+            agents = [AgentDescriptor("codex", "Codex", "codex")]
+        selected = str(
+            getattr(self.service, "active_agent_id", "")
+            or getattr(self.settings, "selected_agent_id", "")
+            or "codex"
+        )
+        self.agent_combo.blockSignals(True)
+        self.agent_combo.clear()
+        for descriptor in agents:
+            self.agent_combo.addItem(descriptor.display_name, descriptor.id)
+            index = self.agent_combo.count() - 1
+            self.agent_combo.setItemData(index, descriptor.description, Qt.ItemDataRole.ToolTipRole)
+        index = self.agent_combo.findData(selected)
+        self.agent_combo.setCurrentIndex(max(0, index))
+        self.agent_combo.blockSignals(False)
+
+    def _agent_changed(self, index: int) -> None:
+        agent_id = str(self.agent_combo.itemData(index) or "")
+        activate = getattr(self.service, "activate", None)
+        if not agent_id or not callable(activate):
+            return
+        if self._turn_active or self._message_queue or self._queue_action_pending:
+            self._show_notice(
+                "Сначала завершите ход и очистите очередь перед сменой агента.",
+                "warning",
+            )
+            self._populate_agents()
+            return
+        if activate(agent_id):
+            if hasattr(type(self.settings), "selected_agent_id"):
+                self.settings.selected_agent_id = agent_id
+            else:
+                self.settings.set("selected_agent_id", agent_id)
+        else:
+            # Activation is atomic: keep the selector aligned with the driver
+            # that remains active when a candidate is unavailable.
+            self._populate_agents()
+
+    def _active_agent_changed(self, agent_id: str) -> None:
+        index = self.agent_combo.findData(agent_id)
+        if index >= 0 and index != self.agent_combo.currentIndex():
+            self.agent_combo.blockSignals(True)
+            self.agent_combo.setCurrentIndex(index)
+            self.agent_combo.blockSignals(False)
+        name = self._agent_name()
+        self.composer.setPlaceholderText(
+            f"Попросите {name} изменить код, найти ошибку или объяснить проект…"
+        )
+        self.composer_hint.setText(
+            f"{name} может ошибаться. Проверяйте команды и изменения файлов."
+        )
+        manifest = getattr(self.service, "manifest", None)
+        self.agent_manifest = manifest if isinstance(manifest, AgentManifest) else AgentManifest()
+        self.agent_config_options = self.agent_manifest.config_options
+        self.models = []
+        self.model_combo.clear()
+        self.effort_combo.clear()
+        self._reset_context_usage()
+        self._apply_agent_capabilities()
+
+    def _agent_availability_changed(self, availability: object) -> None:
+        if not isinstance(availability, AgentAvailability):
+            return
+        if availability.available:
+            detail = f" · {availability.version}" if availability.version else ""
+            self.agent_combo.setToolTip(f"{self._agent_name()} доступен{detail}")
+        else:
+            self.agent_combo.setToolTip(availability.error)
+            self.composer.setEnabled(False)
+
+    def _manifest_updated(self, manifest: object) -> None:
+        if not isinstance(manifest, AgentManifest):
+            return
+        self.agent_manifest = manifest
+        self._set_config_options(manifest.config_options)
+        self._apply_agent_capabilities()
+        self._update_slash_panel()
+
+    def _feature_state(
+        self,
+        feature: FeatureId,
+        legacy_supported: bool = False,
+    ) -> FeatureState:
+        getter = getattr(self.service, "feature_state", None)
+        if callable(getter):
+            state = getter(feature)
+            if isinstance(state, FeatureState):
+                return state
+        return FeatureState(
+            legacy_supported,
+            legacy_supported,
+            "" if legacy_supported else f"Не поддерживается агентом {self._agent_name()}",
+        )
+
+    def _capabilities(self) -> AgentCapabilities:
+        value = getattr(self.service, "capabilities", None)
+        if isinstance(value, AgentCapabilities):
+            return value
+        # Legacy/fake services used by tests represent the fully featured Codex UI.
+        return AgentCapabilities(*([True] * 15))
+
+    def _apply_agent_capabilities(self) -> None:
+        capabilities = self._capabilities()
+        name = self._agent_name()
+        model_state = self._feature_state(FeatureId.CONFIG_MODEL, capabilities.models)
+        thought_state = self._feature_state(
+            FeatureId.CONFIG_THOUGHT_LEVEL,
+            capabilities.reasoning_effort,
+        )
+        settings_supported = model_state.supported or thought_state.supported or bool(
+            self.agent_config_options
+        )
+        settings_enabled = (
+            (model_state.enabled or thought_state.enabled or bool(self.agent_config_options))
+            and self._editing_queued_message is None
+        )
+        self.settings_button.setEnabled(settings_enabled)
+        if not self.settings_button.isEnabled():
+            reason = model_state.reason or thought_state.reason
+            self.settings_button.setToolTip(
+                reason if settings_supported and reason else f"Настройки модели не поддерживаются агентом {name}"
+            )
+        else:
+            self.settings_button.setToolTip("Настройки текущего запроса")
+        access_state = self._feature_state(FeatureId.ACCESS_MODES, capabilities.access_modes)
+        self.access_combo.setEnabled(access_state.enabled and self._editing_queued_message is None)
+        self.access_combo.setToolTip(
+            "Режим доступа для следующего запроса" if access_state.enabled else access_state.reason
+        )
+        attachment_state = self._feature_state(FeatureId.INPUT_FILES, capabilities.attachments)
+        self.attach_button.setEnabled(
+            attachment_state.enabled and self._editing_queued_message is None
+        )
+        self.attach_button.setToolTip(
+            "Добавить вложение" if attachment_state.enabled else attachment_state.reason
+        )
+        quota_state = self._feature_state(FeatureId.USAGE_QUOTA, capabilities.rate_limits)
+        self.weekly_limit.setEnabled(quota_state.enabled)
+        if not quota_state.enabled:
+            self.weekly_limit_label.setText("Лимит —")
+            self.weekly_limit.setToolTip(quota_state.reason)
+        context_state = self._feature_state(FeatureId.USAGE_CONTEXT, capabilities.context_usage)
+        self.context_usage_widget.setEnabled(context_state.enabled)
+        if not context_state.enabled:
+            self.context_usage_label.setText("Контекст —")
+            self.context_usage_widget.setToolTip(context_state.reason)
+            self.context_usage_widget.setVisible(True)
+        self.account_button.setToolTip(
+            "Управление аккаунтом и исполняемым файлом агента"
+            if capabilities.authentication
+            else f"Авторизация не поддерживается агентом {name}; можно изменить путь к CLI"
+        )
 
     def _load_settings(self) -> None:
+        self._populate_agents()
         for path in self.settings.projects:
             self.project_combo.addItem(Path(path).name, path)
         saved_project = self.settings.get("last_project")
         index = self.project_combo.findData(saved_project)
         if index >= 0:
             self.project_combo.setCurrentIndex(index)
-        saved_selection = self.settings.get("run_mode", self.settings.access_mode.value)
+        saved_selection = self._agent_setting("run_mode", self.settings.access_mode.value)
         mode_index = self.access_combo.findData(saved_selection)
         if mode_index >= 0:
             self.access_combo.blockSignals(True)
@@ -1416,6 +1739,7 @@ class MainWindow(QMainWindow):
         ).lower() in {"1", "true", "yes"}
         if self._sidebar_user_hidden:
             self._set_sidebar_visible(False)
+        self._apply_agent_capabilities()
 
     def _add_project(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Выберите рабочую папку")
@@ -1540,7 +1864,7 @@ class MainWindow(QMainWindow):
 
     def _set_models(self, models: list[ModelInfo]) -> None:
         self.models = models
-        saved = self.settings.get("model")
+        saved = self._agent_setting("model")
         self.model_combo.blockSignals(True)
         self.model_combo.clear()
         for model in models:
@@ -1552,6 +1876,83 @@ class MainWindow(QMainWindow):
             self.model_combo.setCurrentIndex(index)
         self.model_combo.blockSignals(False)
         self._model_changed(self.model_combo.currentIndex())
+
+    def _set_config_options(self, options: object) -> None:
+        if not isinstance(options, (list, tuple)):
+            return
+        self.agent_config_options = tuple(
+            option for option in options if isinstance(option, AgentConfigOption)
+        )
+        model_option = next(
+            (option for option in self.agent_config_options if option.category == "model"),
+            None,
+        )
+        thought_option = next(
+            (
+                option
+                for option in self.agent_config_options
+                if option.category == "thought_level"
+            ),
+            None,
+        )
+        efforts = [value.value for value in thought_option.values] if thought_option else []
+        self.models = (
+            [
+                ModelInfo(
+                    value.value,
+                    value.label,
+                    efforts=list(efforts),
+                    default_effort=str(thought_option.current_value) if thought_option else None,
+                    modalities={"text", "image"}
+                    if self._feature_state(FeatureId.INPUT_IMAGES).supported
+                    else {"text"},
+                    is_default=value.value == str(model_option.current_value),
+                )
+                for value in model_option.values
+            ]
+            if model_option
+            else []
+        )
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        for model in self.models:
+            self.model_combo.addItem(model.display_name, model.id)
+        if model_option:
+            index = self.model_combo.findData(str(model_option.current_value))
+            if index >= 0:
+                self.model_combo.setCurrentIndex(index)
+        self.model_combo.blockSignals(False)
+        self.effort_combo.blockSignals(True)
+        self.effort_combo.clear()
+        if thought_option:
+            for value in thought_option.values:
+                self.effort_combo.addItem(value.label, value.value)
+            index = self.effort_combo.findData(str(thought_option.current_value))
+            if index >= 0:
+                self.effort_combo.setCurrentIndex(index)
+        self.effort_combo.blockSignals(False)
+        self._apply_agent_capabilities()
+
+    def _current_agent_config(self) -> dict[str, str | bool]:
+        config: dict[str, str | bool] = {}
+        for option in self.agent_config_options:
+            saved = self._agent_setting(f"config/{option.id}", str(option.current_value))
+            if option.kind == "boolean":
+                config[option.id] = saved.lower() in {"1", "true", "yes", "on"}
+            else:
+                config[option.id] = saved
+        categories = {option.category for option in self.agent_config_options}
+        if "model" not in categories and self.model_combo.currentData():
+            config["model"] = str(self.model_combo.currentData())
+        if "thought_level" not in categories and self.effort_combo.currentData():
+            config["thought_level"] = str(self.effort_combo.currentData())
+        return config
+
+    def _set_config_value(self, option: AgentConfigOption, value: str | bool) -> None:
+        self._set_agent_setting(f"config/{option.id}", value)
+        setter = getattr(self.service, "set_config_option", None)
+        if callable(setter):
+            setter(option.id, value)
 
     def _build_request_settings_menu(self) -> QMenu:
         menu = QMenu(self)
@@ -1609,9 +2010,33 @@ class MainWindow(QMainWindow):
         if not self.effort_combo.count():
             unavailable = effort_menu.addAction("Недоступно для текущей модели")
             unavailable.setEnabled(False)
+        generic_menus: list[QMenu] = []
+        for option in self.agent_config_options:
+            if option.category in {"model", "thought_level"}:
+                continue
+            option_menu = QMenu(option.name, menu)
+            menu.addMenu(option_menu)
+            generic_menus.append(option_menu)
+            if option.kind == "boolean":
+                for label, value in (("Включено", True), ("Выключено", False)):
+                    action = option_menu.addAction(label)
+                    action.setCheckable(True)
+                    action.setChecked(option.current_value is value)
+                    action.triggered.connect(
+                        lambda _checked=False, target=option, selected=value: self._set_config_value(target, selected)
+                    )
+            else:
+                for value in option.values:
+                    action = option_menu.addAction(value.label)
+                    action.setCheckable(True)
+                    action.setChecked(str(option.current_value) == value.value)
+                    action.setToolTip(value.description)
+                    action.triggered.connect(
+                        lambda _checked=False, target=option, selected=value.value: self._set_config_value(target, selected)
+                    )
         # Keep Python wrappers alive for the lifetime of the parent menu.
         # PySide can otherwise release dynamically created submenu wrappers.
-        menu._request_submenus = (model_menu, effort_menu)  # type: ignore[attr-defined]
+        menu._request_submenus = (model_menu, effort_menu, *generic_menus)  # type: ignore[attr-defined]
         return menu
 
     def _show_request_settings_menu(self) -> None:
@@ -1627,8 +2052,16 @@ class MainWindow(QMainWindow):
         if index < 0 or index >= len(self.models):
             return
         model = self.models[index]
-        self.settings.set("model", model.id)
-        saved_effort = self.settings.get("effort", model.default_effort or "")
+        self._set_agent_setting("model", model.id)
+        option = next(
+            (item for item in self.agent_config_options if item.category == "model"),
+            None,
+        )
+        if option is not None:
+            setter = getattr(self.service, "set_config_option", None)
+            if callable(setter):
+                setter(option.id, model.id)
+        saved_effort = self._agent_setting("effort", model.default_effort or "")
         self.effort_combo.blockSignals(True)
         self.effort_combo.clear()
         for effort in model.efforts:
@@ -1645,13 +2078,25 @@ class MainWindow(QMainWindow):
         self._note_next_request_setting()
 
     def _effort_changed(self, _index: int) -> None:
-        self.settings.set("effort", self.effort_combo.currentData() or "")
+        self._set_agent_setting("effort", self.effort_combo.currentData() or "")
+        option = next(
+            (
+                item
+                for item in self.agent_config_options
+                if item.category == "thought_level"
+            ),
+            None,
+        )
+        if option is not None and self.effort_combo.currentData():
+            setter = getattr(self.service, "set_config_option", None)
+            if callable(setter):
+                setter(option.id, str(self.effort_combo.currentData()))
         self._note_next_request_setting()
 
     def _access_changed(self, _index: int) -> None:
         selected = str(self.access_combo.currentData())
         if selected == PLAN_MODE_VALUE:
-            self.settings.set("run_mode", PLAN_MODE_VALUE)
+            self._set_agent_setting("run_mode", PLAN_MODE_VALUE)
             self._refresh_access_style()
             self._note_next_request_setting()
             return
@@ -1663,7 +2108,7 @@ class MainWindow(QMainWindow):
             answer = QMessageBox.warning(
                 self,
                 "Полный доступ",
-                "Codex сможет читать и изменять файлы вне рабочей папки, а также выполнять "
+                f"{self._agent_name()} сможет читать и изменять файлы вне рабочей папки, а также выполнять "
                 "команды без дополнительных подтверждений. Включить полный доступ?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
@@ -1672,8 +2117,8 @@ class MainWindow(QMainWindow):
                 self.access_combo.setCurrentIndex(self.access_combo.findData(AccessMode.WORKSPACE_WRITE.value))
                 return
             self._danger_acknowledged = True
-        self.settings.access_mode = mode
-        self.settings.set("run_mode", mode.value)
+        self._set_agent_setting("access_mode", mode.value)
+        self._set_agent_setting("run_mode", mode.value)
         self._refresh_access_style()
         self._note_next_request_setting()
 
@@ -1686,7 +2131,7 @@ class MainWindow(QMainWindow):
             PLAN_MODE_VALUE: "plan",
         }.get(selected, "workspace")
         descriptions = {
-            AccessMode.READ_ONLY.value: "Только чтение: Codex не сможет изменять файлы",
+            AccessMode.READ_ONLY.value: f"Только чтение: {self._agent_name()} не сможет изменять файлы",
             AccessMode.WORKSPACE_WRITE.value: "Рабочая папка: изменения разрешены только внутри проекта",
             AccessMode.FULL_ACCESS.value: "Полный доступ: команды выполняются без дополнительных подтверждений",
             PLAN_MODE_VALUE: "Режим планирования: анализ без изменения файлов",
@@ -1734,13 +2179,45 @@ class MainWindow(QMainWindow):
                 return []
         has_thread = bool(getattr(self.service, "current_thread_id", ""))
         matches: list[tuple[SlashCommand, bool, str]] = []
-        for command in SLASH_COMMANDS:
+        capabilities = self._capabilities()
+        feature_by_command = {
+            "compact": self._feature_state(FeatureId.SESSION_COMPACT, capabilities.compact),
+            "review": self._feature_state(FeatureId.SESSION_REVIEW, capabilities.review),
+            "fork": self._feature_state(FeatureId.SESSION_FORK, capabilities.fork),
+            "plan": self._feature_state(FeatureId.RUN_PLAN, capabilities.plan_mode),
+        }
+        action_state = getattr(self.service, "action_state", None)
+        for command in self._all_slash_commands():
             if not command.syntax.startswith(prefix):
                 continue
             available = not command.needs_thread or has_thread
             reason = "" if available else "Сначала создайте текущий чат"
+            state = feature_by_command.get(command.name)
+            if state is None and command.name not in SLASH_COMMANDS_BY_NAME and callable(action_state):
+                candidate = action_state(command.name)
+                state = candidate if isinstance(candidate, FeatureState) else None
+            if state is not None and not state.enabled:
+                available = False
+                reason = state.reason
             matches.append((command, available, reason))
         return matches
+
+    def _all_slash_commands(self) -> tuple[SlashCommand, ...]:
+        existing = set(SLASH_COMMANDS_BY_NAME)
+        dynamic = tuple(
+            SlashCommand(
+                action.id,
+                action.description or action.title,
+                accepts_arguments=bool(action.argument_hint),
+                needs_thread=action.requires_session,
+            )
+            for action in self.agent_manifest.actions
+            if action.id not in existing
+        )
+        return SLASH_COMMANDS + dynamic
+
+    def _slash_commands_by_name(self) -> dict[str, SlashCommand]:
+        return {command.name: command for command in self._all_slash_commands()}
 
     def _update_slash_panel(self) -> None:
         matches = self._matching_slash_commands()
@@ -1766,7 +2243,7 @@ class MainWindow(QMainWindow):
         self._insert_slash_completion(selected)
 
     def _insert_slash_completion(self, name: str) -> str:
-        command = SLASH_COMMANDS_BY_NAME[name]
+        command = self._slash_commands_by_name()[name]
         text = self.composer.toPlainText()
         cursor_position = self.composer.textCursor().position()
         if cursor_position == 0 and text.startswith("/") and not any(
@@ -1805,13 +2282,12 @@ class MainWindow(QMainWindow):
         self._update_slash_panel()
         self.composer.setFocus()
 
-    @staticmethod
-    def _parse_slash_command(text: str) -> tuple[str, str] | None:
+    def _parse_slash_command(self, text: str) -> tuple[str, str] | None:
         if not text.startswith("/"):
             return None
         token, separator, arguments = text.partition(" ")
         name = token[1:]
-        if name not in SLASH_COMMANDS_BY_NAME:
+        if name not in self._slash_commands_by_name():
             return None
         return name, arguments.strip() if separator else ""
 
@@ -1876,7 +2352,24 @@ class MainWindow(QMainWindow):
         self._submit_message(text)
 
     def _execute_slash_command(self, name: str, arguments: str, syntax: str) -> None:
-        command = SLASH_COMMANDS_BY_NAME[name]
+        command = self._slash_commands_by_name()[name]
+        capabilities = self._capabilities()
+        state = {
+            "compact": self._feature_state(FeatureId.SESSION_COMPACT, capabilities.compact),
+            "review": self._feature_state(FeatureId.SESSION_REVIEW, capabilities.review),
+            "fork": self._feature_state(FeatureId.SESSION_FORK, capabilities.fork),
+            "plan": self._feature_state(FeatureId.RUN_PLAN, capabilities.plan_mode),
+        }.get(name)
+        action_state = getattr(self.service, "action_state", None)
+        if state is None and name not in SLASH_COMMANDS_BY_NAME and callable(action_state):
+            candidate = action_state(name)
+            state = candidate if isinstance(candidate, FeatureState) else None
+        if state is not None and not state.enabled:
+            self._show_notice(
+                state.reason,
+                "warning",
+            )
+            return
         if command.needs_thread and not getattr(self.service, "current_thread_id", ""):
             self._show_notice(
                 "Команда недоступна: сначала создайте или откройте чат.",
@@ -1914,7 +2407,7 @@ class MainWindow(QMainWindow):
         queue_syntax: str | None = None,
     ) -> None:
         if getattr(self.service, "connected", True) is False:
-            self._show_error("Codex app-server ещё не подключен")
+            self._show_error(f"{self._agent_name()} ещё не подключен")
             return
         if not getattr(self.service, "current_project", ""):
             self._add_project()
@@ -1958,6 +2451,7 @@ class MainWindow(QMainWindow):
             access_mode,
             collaboration_mode,
             queue_syntax,
+            self._current_agent_config(),
         )
         if self._turn_active or self._queue_action_pending:
             self._message_queue.append(message)
@@ -1970,7 +2464,7 @@ class MainWindow(QMainWindow):
     def _dispatch_message(self, message: QueuedMessage) -> bool:
         if getattr(self.service, "connected", True) is False:
             self._show_notice(
-                "Очередь приостановлена: Codex не подключён.",
+                f"Очередь приостановлена: {self._agent_name()} не подключён.",
                 "warning",
                 6000,
             )
@@ -1984,27 +2478,62 @@ class MainWindow(QMainWindow):
             self._render_message_queue()
             return False
         self._active_collaboration_mode = message.collaboration_mode
-        self.service.send_message(
-            message.text,
-            message.attachments,
-            message.model,
-            message.effort,
-            message.access_mode,
-            message.collaboration_mode,
-        )
+        submit_prompt = getattr(self.service, "submit_prompt", None)
+        if callable(submit_prompt):
+            config = dict(message.config)
+            option_by_category = {
+                option.category: option for option in self.agent_config_options
+            }
+            if message.model:
+                model_option = option_by_category.get("model")
+                config[model_option.id if model_option else "model"] = message.model
+            if message.effort:
+                thought_option = option_by_category.get("thought_level")
+                config[
+                    thought_option.id if thought_option else "thought_level"
+                ] = message.effort
+            submit_prompt(
+                AgentPrompt(
+                    message.text,
+                    tuple(message.attachments),
+                    getattr(self.service, "current_project", ""),
+                    config,
+                    message.collaboration_mode or "",
+                    message.access_mode,
+                )
+            )
+        else:
+            self.service.send_message(
+                message.text,
+                message.attachments,
+                message.model,
+                message.effort,
+                message.access_mode,
+                message.collaboration_mode,
+            )
         return True
 
     def _dispatch_command(self, command: QueuedCommand) -> None:
+        invoke = getattr(self.service, "invoke_action", None)
         if command.name == "compact":
-            self.service.compact_thread()
+            if callable(invoke):
+                invoke("compact", command.arguments)
+            else:
+                self.service.compact_thread()
             return
         if command.name == "review":
-            self.service.start_review(command.arguments)
+            if callable(invoke):
+                invoke("review", command.arguments)
+            else:
+                self.service.start_review(command.arguments)
             return
         if command.name == "fork":
             self._queue_action_pending = True
             self._render_message_queue()
-            self.service.fork_thread(self._fork_finished)
+            if callable(invoke):
+                invoke("fork", command.arguments, self._fork_finished)
+            else:
+                self.service.fork_thread(self._fork_finished)
             return
         if command.name == "new":
             if not self._prepare_new_chat(clear_queue=False):
@@ -2012,6 +2541,9 @@ class MainWindow(QMainWindow):
                 self._render_message_queue()
                 return
             QTimer.singleShot(0, self._send_next_queued)
+            return
+        if callable(invoke):
+            invoke(command.name, command.arguments)
 
     def _fork_finished(self, success: bool) -> None:
         self._queue_action_pending = False
@@ -2128,6 +2660,7 @@ class MainWindow(QMainWindow):
             composer_panel.style().polish(composer_panel)
         self._refresh_send_button()
         self._render_message_queue()
+        self._apply_agent_capabilities()
         if resume_queue:
             QTimer.singleShot(0, self._send_next_queued)
 
@@ -2235,6 +2768,7 @@ class MainWindow(QMainWindow):
         self.new_chat_button.setEnabled(navigation_enabled)
         self.thread_list.setEnabled(navigation_enabled)
         self.project_combo.setEnabled(navigation_enabled)
+        self.agent_combo.setEnabled(navigation_enabled and not bool(count))
 
     def _selected_model(self) -> ModelInfo | None:
         model_id = self.model_combo.currentData()
@@ -2340,16 +2874,17 @@ class MainWindow(QMainWindow):
 
     def _upsert_item(self, item: dict[str, Any], complete: bool) -> None:
         item_id = str(item.get("id") or uuid.uuid4())
-        kind = str(item.get("type", "unknown"))
+        kind = str(item.get("kind") or item.get("type", "unknown"))
+        subtype = str(item.get("subtype") or item.get("type", ""))
         card = self.cards.get(item_id)
-        if kind == "userMessage":
+        if kind in {"userMessage", "user_message"}:
             text = self._user_message_text(item.get("content", []))
             if not isinstance(card, MessageCard):
                 card = MessageCard("user", text)
                 self._add_card(item_id, card)
             else:
                 card.set_text(text)
-        elif kind == "agentMessage":
+        elif kind in {"agentMessage", "assistant_message"}:
             self._set_thinking_activity("ИИ пишет ответ")
             text = str(item.get("text", ""))
             if not isinstance(card, MessageCard):
@@ -2376,7 +2911,7 @@ class MainWindow(QMainWindow):
             summary = item.get("summary", [])
             text = "\n".join(summary) if isinstance(summary, list) else str(summary or item.get("content", ""))
             self._activity(item_id, "Размышления", text)
-        elif kind == "commandExecution":
+        elif kind in {"commandExecution", "command"}:
             self._set_thinking_activity("ИИ выполняет команду")
             command = item.get("command", "Команда")
             if isinstance(command, list):
@@ -2388,39 +2923,55 @@ class MainWindow(QMainWindow):
                 f"Терминал · {localized_status(status)}: {command}",
                 output,
             )
-        elif kind == "fileChange":
+        elif kind in {"fileChange", "file_change"}:
             self._set_thinking_activity("ИИ изменяет файлы")
             changes = item.get("changes", [])
             paths = [str(change.get("path", "")) for change in changes if isinstance(change, dict)]
             diffs = [str(change.get("diff", "")) for change in changes if isinstance(change, dict)]
             self._activity(item_id, "Изменения файлов: " + ", ".join(paths), "\n".join(diffs))
-        elif kind == "contextCompaction":
+        elif kind == "contextCompaction" or (
+            kind == "system_activity" and subtype == "contextCompaction"
+        ):
             self._set_thinking_activity("ИИ сжимает контекст")
             self._activity(
                 item_id,
                 "Контекст сжат",
                 self._compact_item(item) or "История чата сжата для продолжения работы.",
             )
-        elif kind == "enteredReviewMode":
+        elif kind == "enteredReviewMode" or (
+            kind == "system_activity" and subtype == "enteredReviewMode"
+        ):
             self._set_thinking_activity("ИИ проверяет изменения")
             self._activity(
                 item_id,
                 "Режим ревью запущен",
-                self._compact_item(item) or "Codex проверяет выбранные изменения.",
+                self._compact_item(item) or "Агент проверяет выбранные изменения.",
             )
-        elif kind == "exitedReviewMode":
+        elif kind == "exitedReviewMode" or (
+            kind == "system_activity" and subtype == "exitedReviewMode"
+        ):
             self._activity(
                 item_id,
                 "Режим ревью завершён",
-                self._compact_item(item) or "Codex завершил проверку изменений.",
+                self._compact_item(item) or "Агент завершил проверку изменений.",
             )
-        elif kind in {"mcpToolCall", "dynamicToolCall", "webSearch", "collabToolCall"}:
+        elif kind == "tool_call" or kind in {
+            "mcpToolCall",
+            "dynamicToolCall",
+            "webSearch",
+            "collabToolCall",
+        }:
             self._set_thinking_activity(
                 "ИИ ищет в интернете"
-                if kind == "webSearch"
+                if subtype == "webSearch" or kind == "webSearch"
                 else "ИИ использует инструмент"
             )
-            title = str(item.get("tool") or item.get("query") or item.get("type"))
+            title = str(
+                item.get("tool")
+                or item.get("query")
+                or subtype
+                or kind
+            )
             self._activity(item_id, title, self._compact_item(item))
         self._scroll_bottom()
 
@@ -2541,6 +3092,7 @@ class MainWindow(QMainWindow):
         self.new_chat_button.setEnabled(not active)
         self.thread_list.setEnabled(not active)
         self.project_combo.setEnabled(not active)
+        self.agent_combo.setEnabled(not active and not bool(self._message_queue))
         self.model_combo.setEnabled(True)
         self.effort_combo.setEnabled(True)
         editing_queue = self._editing_queued_message is not None
@@ -2548,9 +3100,10 @@ class MainWindow(QMainWindow):
         self.access_combo.setEnabled(not editing_queue)
         self.settings_button.setEnabled(not editing_queue)
         self._refresh_access_style()
+        self._apply_agent_capabilities()
         self._render_message_queue()
         self.statusBar().showMessage(
-            "Codex работает…" if active else f"Ход: {localized_status(status)}",
+            f"{self._agent_name()} работает…" if active else f"Ход: {localized_status(status)}",
             4000,
         )
         if was_active and not active:
@@ -2559,11 +3112,11 @@ class MainWindow(QMainWindow):
             self._turn_timer.invalidate()
             self._add_turn_duration(status, elapsed_ms)
             if status == "failed":
-                self._show_desktop_notification("Codex", "Запрос завершился с ошибкой")
+                self._show_desktop_notification(self._agent_name(), "Запрос завершился с ошибкой")
             elif status in {"interrupted", "cancelled", "canceled"}:
-                self._show_desktop_notification("Codex", "Выполнение запроса остановлено")
+                self._show_desktop_notification(self._agent_name(), "Выполнение запроса остановлено")
             else:
-                self._show_desktop_notification("Codex", "Выполнение запроса завершено")
+                self._show_desktop_notification(self._agent_name(), "Выполнение запроса завершено")
             if status in {"failed", "interrupted", "cancelled", "canceled"}:
                 if self._message_queue:
                     self._queue_paused = True
@@ -2670,7 +3223,7 @@ class MainWindow(QMainWindow):
         return "\n\n".join(parts)
 
     def _compact_item(self, item: dict[str, Any]) -> str:
-        omitted = {"id", "type", "status"}
+        omitted = {"id", "type", "kind", "subtype", "status"}
         return "\n".join(f"{key}: {value}" for key, value in item.items() if key not in omitted)
 
     def _scroll_bottom(self) -> None:
@@ -2746,6 +3299,10 @@ class MainWindow(QMainWindow):
             return
         if account.get("type") == "chatgpt":
             self.account_button.setText("  ◉   " + (account.get("email") or "ChatGPT"))
+        elif account.get("type") == "acp":
+            self.account_button.setText(
+                "  ◉   " + str(account.get("name") or self._agent_name())
+            )
         else:
             self.account_button.setText("  ◉   API key")
 
@@ -2755,7 +3312,11 @@ class MainWindow(QMainWindow):
             self.weekly_limit_label.setText("Неделя —")
             self.weekly_limit_bar.setValue(0)
             level = "unavailable"
-            tooltip = "Недельный лимит недоступен для текущего типа авторизации"
+            state = self._feature_state(
+                FeatureId.USAGE_QUOTA,
+                self._capabilities().rate_limits,
+            )
+            tooltip = state.reason or "Данные о недельном лимите временно недоступны"
         else:
             remaining = window.remaining_percent
             self.weekly_limit_label.setText(f"Неделя {remaining}%")
@@ -2785,31 +3346,131 @@ class MainWindow(QMainWindow):
         used_text = f"{used:,}".replace(",", " ")
         window_text = f"{window:,}".replace(",", " ")
         self.context_usage_widget.setToolTip(
-            f"Использовано {used_text} из {window_text} токенов по последнему обновлению Codex"
+            f"Использовано {used_text} из {window_text} токенов по последнему обновлению {self._agent_name()}"
         )
         self.context_usage_widget.setVisible(True)
 
     def _reset_context_usage(self) -> None:
         self.context_usage_label.setText("Контекст —")
         self.context_usage_bar.setValue(0)
-        self.context_usage_widget.setVisible(False)
+        state = self._feature_state(
+            FeatureId.USAGE_CONTEXT,
+            self._capabilities().context_usage,
+        )
+        self.context_usage_widget.setToolTip(
+            "Ожидание данных об использовании контекста" if state.supported else state.reason
+        )
+        self.context_usage_widget.setVisible(True)
 
     def _account_menu(self) -> None:
         menu = QMenu(self)
         account = self.service.account
-        if account:
+        capabilities = self._capabilities()
+        auth_methods = self.agent_manifest.auth_methods
+        if account and capabilities.authentication:
             title = account.get("email") or account.get("type", "Аккаунт")
             info = menu.addAction(str(title))
             info.setEnabled(False)
             menu.addSeparator()
-            menu.addAction("Выйти", self.service.logout)
-        else:
+            if callable(getattr(self.service, "logout", None)):
+                menu.addAction("Выйти", self.service.logout)
+        elif auth_methods:
+            for method in auth_methods:
+                menu.addAction(
+                    method.name,
+                    lambda _checked=False, target=method: self._authenticate_method(target),
+                )
+        elif capabilities.authentication:
             menu.addAction("Войти через ChatGPT", self.service.login_chatgpt)
             menu.addAction("Войти с API-ключом", self._api_key_login)
+        else:
+            unavailable = menu.addAction(
+                f"Авторизация не поддерживается агентом {self._agent_name()}"
+            )
+            unavailable.setEnabled(False)
+        if callable(getattr(self.service, "set_executable", None)):
+            menu.addSeparator()
+            menu.addAction("Указать путь к CLI…", self._choose_agent_executable)
+        if callable(getattr(self.service, "add_profile", None)):
+            menu.addAction("Добавить ACP-агента…", self._add_acp_profile)
+            profile = getattr(self.service, "profile", None)
+            if isinstance(profile, AgentProfile) and not profile.built_in:
+                menu.addAction(
+                    f"Удалить профиль «{profile.display_name}»",
+                    self._remove_current_profile,
+                )
         menu.exec(self.account_button.mapToGlobal(self.account_button.rect().bottomLeft()))
 
+    def _authenticate_method(self, method: AuthMethod) -> None:
+        secret = ""
+        if method.kind == "secret":
+            dialog = ApiKeyDialog(self._agent_name(), self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            secret = dialog.input.text().strip()
+            dialog.input.clear()
+            if not secret:
+                return
+        authenticate = getattr(self.service, "authenticate", None)
+        if callable(authenticate):
+            authenticate(method.id, secret)
+
+    def _add_acp_profile(self) -> None:
+        dialog = AcpProfileDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        profiles = getattr(self.service, "available_profiles", [])
+        profile = dialog.profile(
+            {item.id for item in profiles if isinstance(item, AgentProfile)}
+        )
+        try:
+            self.service.add_profile(profile)
+        except ValueError as exc:
+            self._show_error(str(exc))
+            return
+        self._populate_agents()
+        index = self.agent_combo.findData(profile.id)
+        if index >= 0:
+            self.agent_combo.setCurrentIndex(index)
+
+    def _remove_current_profile(self) -> None:
+        profile = getattr(self.service, "profile", None)
+        if not isinstance(profile, AgentProfile) or profile.built_in:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Удалить профиль агента",
+            f"Удалить профиль «{profile.display_name}»? История самого агента не удаляется.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.service.remove_profile(profile.id)
+        self._populate_agents()
+        if self.agent_combo.count():
+            next_id = str(self.agent_combo.itemData(0) or "")
+            if next_id and self.service.activate(next_id):
+                self.agent_combo.setCurrentIndex(0)
+                if hasattr(type(self.settings), "selected_agent_id"):
+                    self.settings.selected_agent_id = next_id
+
+    def _choose_agent_executable(self) -> None:
+        path, _filter = QFileDialog.getOpenFileName(
+            self,
+            f"Исполняемый файл {self._agent_name()}",
+        )
+        if not path:
+            return
+        setter = getattr(self.service, "set_executable", None)
+        if callable(setter) and setter(self._agent_id(), path):
+            self._show_notice(
+                f"Путь к {self._agent_name()} сохранён.",
+                "info",
+            )
+
     def _api_key_login(self) -> None:
-        dialog = ApiKeyDialog(self)
+        dialog = ApiKeyDialog(self._agent_name(), self)
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.input.text().strip():
             key = dialog.input.text().strip()
             dialog.input.clear()
@@ -2863,11 +3524,11 @@ class MainWindow(QMainWindow):
             paths = params.get("paths") or params.get("files") or []
             affected = "\n".join(f"• {path}" for path in paths) if isinstance(paths, list) else str(paths)
             scope = affected or f"Внутри проекта: {project}"
-            detail = f"Codex запрашивает изменение файлов.\n\nОбласть:\n{scope}\n\nЗачем это нужно:\n{reason}"
+            detail = f"{self._agent_name()} запрашивает изменение файлов.\n\nОбласть:\n{scope}\n\nЗачем это нужно:\n{reason}"
         else:
             title = "Дополнительные разрешения"
             detail = (
-                "Codex запрашивает доступ за пределами обычного режима.\n\n"
+                f"{self._agent_name()} запрашивает доступ за пределами обычного режима.\n\n"
                 f"Запрошено:\n{self._permission_summary(params.get('permissions', {}))}"
                 f"\n\nЗачем это нужно:\n{reason}"
             )
@@ -2878,7 +3539,30 @@ class MainWindow(QMainWindow):
         summary = " ".join(detail.split())
         if len(summary) > 150:
             summary = summary[:147] + "…"
-        self._show_desktop_notification("Codex ждёт подтверждения", summary)
+        self._show_desktop_notification(f"{self._agent_name()} ждёт подтверждения", summary)
+
+    def _permission_requested(self, request: object) -> None:
+        if not isinstance(request, PermissionRequest):
+            return
+        self._set_thinking_activity("ИИ ждёт подтверждения")
+        self._approval_queue.append(
+            ApprovalPrompt(
+                request.request_id,
+                "",
+                {},
+                request.title,
+                request.detail,
+                request.options,
+            )
+        )
+        self._show_next_approval()
+        summary = " ".join(request.detail.split())
+        if len(summary) > 150:
+            summary = summary[:147] + "…"
+        self._show_desktop_notification(
+            f"{self._agent_name()} ждёт подтверждения",
+            summary,
+        )
 
     def _show_next_approval(self) -> None:
         if self._current_approval is not None or not self._approval_queue:
@@ -2887,6 +3571,7 @@ class MainWindow(QMainWindow):
         self.approval_card.set_request(
             self._current_approval.title,
             self._current_approval.detail,
+            self._current_approval.options,
         )
         self.approval_card.setVisible(True)
 
@@ -2896,12 +3581,16 @@ class MainWindow(QMainWindow):
         prompt = self._current_approval
         self._current_approval = None
         self.approval_card.setVisible(False)
-        self.service.answer_approval(
-            prompt.request_id,
-            decision,
-            prompt.method,
-            prompt.params,
-        )
+        resolver = getattr(self.service, "resolve_permission", None)
+        if not prompt.method and callable(resolver):
+            resolver(prompt.request_id, decision)
+        else:
+            self.service.answer_approval(
+                prompt.request_id,
+                decision,
+                prompt.method,
+                prompt.params,
+            )
         self._show_next_approval()
 
     def _user_input_requested(self, request_id: object, params: dict[str, Any]) -> None:
@@ -2909,10 +3598,10 @@ class MainWindow(QMainWindow):
         self._user_input_queue.append((request_id, params))
         self._show_next_user_input()
         questions = params.get("questions", [])
-        prompt = "Codex ожидает подтверждение или ответ"
+        prompt = f"{self._agent_name()} ожидает подтверждение или ответ"
         if questions and isinstance(questions[0], dict):
             prompt = str(questions[0].get("question") or prompt)
-        self._show_desktop_notification("Codex ждёт ответа", prompt)
+        self._show_desktop_notification(f"{self._agent_name()} ждёт ответа", prompt)
 
     def _show_next_user_input(self) -> None:
         if self._current_user_input is not None or not self._user_input_queue:
@@ -2995,7 +3684,7 @@ class MainWindow(QMainWindow):
 
     def _show_error(self, message: str) -> None:
         self.statusBar().showMessage(message, 8000)
-        QMessageBox.warning(self, "Codex", message)
+        QMessageBox.warning(self, self._agent_name(), message)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._closing = True

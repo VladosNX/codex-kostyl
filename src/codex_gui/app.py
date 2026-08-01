@@ -1,21 +1,21 @@
 from __future__ import annotations
 
-import re
-import shutil
-import subprocess
 import sys
 from importlib.resources import files
 
 from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+from .agents import AgentController, AgentRegistry
+from .agents.acp import acp_driver_registration
+from .agents.codex import (
+    CodexDriver,
+    codex_driver_registration,
+    codex_profile,
+)
 from .main_window import MainWindow
 from .diagnostics import configure_diagnostics
-from .rpc import CodexProcess, JsonRpcClient
-from .service import CodexService
 from .settings import AppSettings
-
-MIN_CODEX_VERSION = (0, 146, 0)
 
 STYLE = """
 QWidget { background: #111315; color: #e8e8e6; font-size: 13px; selection-background-color: #4b5650; selection-color: #fff; }
@@ -191,28 +191,12 @@ QStatusBar::item { border: 0; }
 
 
 def codex_preflight() -> tuple[str | None, str | None]:
-    path = shutil.which("codex")
-    if not path:
-        return None, "Codex CLI не найден в PATH. Установите Codex и перезапустите приложение."
-    try:
-        completed = subprocess.run(
-            [path, "--version"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=True,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        return None, f"Не удалось проверить Codex CLI: {exc}"
-    output = completed.stdout.strip() or completed.stderr.strip()
-    match = re.search(r"(\d+)\.(\d+)\.(\d+)", output)
-    if not match:
-        return None, f"Не удалось определить версию Codex: {output.strip()}"
-    version = tuple(map(int, match.groups()))
-    if version < MIN_CODEX_VERSION:
-        required = ".".join(map(str, MIN_CODEX_VERSION))
-        return None, f"Нужен Codex CLI {required} или новее; установлен {'.'.join(map(str, version))}."
-    return path, None
+    """Compatibility wrapper around the Codex driver's availability probe."""
+    availability = CodexDriver.check_availability()
+    return (
+        availability.executable if availability.available else None,
+        None if availability.available else availability.error,
+    )
 
 
 def main() -> int:
@@ -230,38 +214,45 @@ def main() -> int:
     app.setStyleSheet(STYLE)
     logger = configure_diagnostics()
 
-    codex_path, error = codex_preflight()
-    if error:
-        QMessageBox.critical(None, "Codex Kostyl", error)
-        return 1
-
-    process = CodexProcess(codex_path or "codex")
-    rpc = JsonRpcClient(process)
-    service = CodexService(rpc)
     settings = AppSettings()
-    window = MainWindow(service, settings, process.stop)
-    process.started.connect(rpc.initialize)
-    process.protocolError.connect(lambda message: logger.error("Protocol/process error: %s", message))
+    registry = AgentRegistry()
+    registry.register_driver(codex_driver_registration())
+    registry.register_driver(acp_driver_registration())
+    registry.add_profile(codex_profile())
+    for profile in settings.agent_profiles:
+        try:
+            registry.add_profile(profile)
+        except ValueError as exc:
+            logger.warning("Ignored invalid agent profile %s: %s", profile.id, exc)
+    service = AgentController(registry, settings)
+    window = MainWindow(service, settings, service.stop)
+    service.errorOccurred.connect(
+        lambda message: logger.error("Agent/protocol error: %s", message)
+    )
 
     def server_stopped(code: int, status: str) -> None:
-        logger.warning("app-server stopped: code=%s status=%s", code, status)
+        name = service.descriptor.display_name or "Агент"
+        logger.warning("agent stopped: id=%s code=%s status=%s", service.active_agent_id, code, status)
         if window._closing:
             return
-        window.statusBar().showMessage(f"Codex app-server остановлен ({code}, {status})")
+        window.statusBar().showMessage(f"{name} остановлен ({code}, {status})")
         answer = QMessageBox.question(
             window,
-            "Codex app-server остановлен",
-            "Перезапустить Codex app-server? Сохраненные чаты не будут потеряны.",
+            f"{name} остановлен",
+            f"Перезапустить {name}? Сохранённые чаты не будут потеряны.",
             QMessageBox.StandardButton.Retry | QMessageBox.StandardButton.Close,
             QMessageBox.StandardButton.Retry,
         )
         if answer == QMessageBox.StandardButton.Retry:
-            service.connected = False
-            process.start()
+            service.restart()
         else:
             window.close()
 
-    process.stopped.connect(server_stopped)
+    service.processStopped.connect(server_stopped)
     window.show()
-    process.start()
+    selected_profile = settings.selected_agent_id
+    if registry.profile(selected_profile) is None:
+        selected_profile = "codex"
+        settings.selected_agent_id = selected_profile
+    service.activate(selected_profile)
     return app.exec()

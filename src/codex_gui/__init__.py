@@ -1,4 +1,4 @@
-"""Codex Kostyl — a native Linux client for Codex CLI."""
+"""Codex Kostyl — a desktop client for local AI coding agents."""
 
 from importlib.metadata import PackageNotFoundError, version
 

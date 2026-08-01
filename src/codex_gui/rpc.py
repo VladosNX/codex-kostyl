@@ -53,16 +53,28 @@ class JsonLineDecoder:
             errors.append(f"Некорректное сообщение app-server: {exc}")
 
 
-class CodexProcess(QObject):
+class JsonLineProcess(QObject):
+    """Cross-platform NDJSON subprocess transport.
+
+    QProcess keeps argument quoting platform-correct; drivers provide the
+    executable and argument vector without invoking a shell.
+    """
+
     messageReceived = Signal(dict)
     stderrReceived = Signal(str)
     protocolError = Signal(str)
     started = Signal()
     stopped = Signal(int, str)
 
-    def __init__(self, codex_path: str = "codex", parent: QObject | None = None) -> None:
+    def __init__(
+        self,
+        program: str,
+        arguments: list[str] | None = None,
+        parent: QObject | None = None,
+    ) -> None:
         super().__init__(parent)
-        self.codex_path = codex_path
+        self.program = program
+        self.arguments = list(arguments or [])
         self.process = QProcess(self)
         self.process.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
         self.process.readyReadStandardOutput.connect(self._read_stdout)
@@ -77,8 +89,8 @@ class CodexProcess(QObject):
             return
         self._decoder = JsonLineDecoder()
         self.process.blockSignals(False)
-        self.process.setProgram(self.codex_path)
-        self.process.setArguments(["app-server", "--stdio"])
+        self.process.setProgram(self.program)
+        self.process.setArguments(self.arguments)
         self.process.start()
 
     def stop(self) -> None:
@@ -97,7 +109,7 @@ class CodexProcess(QObject):
 
     def send(self, payload: dict[str, Any]) -> None:
         if self.process.state() == QProcess.ProcessState.NotRunning:
-            raise RuntimeError("Codex app-server не запущен")
+            raise RuntimeError("Процесс агента не запущен")
         wire = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
         self.process.write(wire)
 
@@ -126,7 +138,16 @@ class CodexProcess(QObject):
         self.stopped.emit(exit_code, exit_status.name)
 
     def _process_error(self, error: QProcess.ProcessError) -> None:
-        self.protocolError.emit(f"Ошибка запуска Codex: {error.name}: {self.process.errorString()}")
+        self.protocolError.emit(
+            f"Ошибка запуска процесса агента: {error.name}: {self.process.errorString()}"
+        )
+
+
+class CodexProcess(JsonLineProcess):
+    """Compatibility wrapper for the original public transport name."""
+
+    def __init__(self, codex_path: str = "codex", parent: QObject | None = None) -> None:
+        super().__init__(codex_path, ["app-server", "--stdio"], parent)
 
 
 class JsonRpcClient(QObject):
@@ -136,9 +157,15 @@ class JsonRpcClient(QObject):
     initialized = Signal(dict)
     disconnected = Signal()
 
-    def __init__(self, transport: CodexProcess, parent: QObject | None = None) -> None:
+    def __init__(
+        self,
+        transport: JsonLineProcess,
+        parent: QObject | None = None,
+        jsonrpc_version: str | None = None,
+    ) -> None:
         super().__init__(parent)
         self.transport = transport
+        self.jsonrpc_version = jsonrpc_version
         self._next_id = 1
         self._pending: dict[int, RpcCallback] = {}
         transport.messageReceived.connect(self._on_message)
@@ -166,20 +193,32 @@ class JsonRpcClient(QObject):
         self._next_id += 1
         self._pending[request_id] = callback or (lambda _result, _error: None)
         try:
-            self.transport.send({"method": method, "id": request_id, "params": params})
+            payload = {"method": method, "id": request_id, "params": params}
+            if self.jsonrpc_version:
+                payload["jsonrpc"] = self.jsonrpc_version
+            self.transport.send(payload)
         except Exception:
             self._pending.pop(request_id, None)
             raise
         return request_id
 
     def notify(self, method: str, params: dict[str, Any]) -> None:
-        self.transport.send({"method": method, "params": params})
+        payload = {"method": method, "params": params}
+        if self.jsonrpc_version:
+            payload["jsonrpc"] = self.jsonrpc_version
+        self.transport.send(payload)
 
     def respond(self, request_id: object, result: Any) -> None:
-        self.transport.send({"id": request_id, "result": result})
+        payload = {"id": request_id, "result": result}
+        if self.jsonrpc_version:
+            payload["jsonrpc"] = self.jsonrpc_version
+        self.transport.send(payload)
 
     def respond_error(self, request_id: object, code: int, message: str) -> None:
-        self.transport.send({"id": request_id, "error": {"code": code, "message": message}})
+        payload = {"id": request_id, "error": {"code": code, "message": message}}
+        if self.jsonrpc_version:
+            payload["jsonrpc"] = self.jsonrpc_version
+        self.transport.send(payload)
 
     def _initialized(self, result: Any | None, error: dict[str, Any] | None) -> None:
         if error:

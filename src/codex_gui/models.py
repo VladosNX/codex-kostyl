@@ -39,6 +39,17 @@ class AccessMode(str, Enum):
         return "never" if self is AccessMode.FULL_ACCESS else "on-request"
 
 
+class TimelineItemKind(str, Enum):
+    USER_MESSAGE = "user_message"
+    ASSISTANT_MESSAGE = "assistant_message"
+    PLAN = "plan"
+    REASONING = "reasoning"
+    COMMAND = "command"
+    FILE_CHANGE = "file_change"
+    TOOL_CALL = "tool_call"
+    SYSTEM_ACTIVITY = "system_activity"
+
+
 @dataclass(slots=True)
 class Attachment:
     path: Path

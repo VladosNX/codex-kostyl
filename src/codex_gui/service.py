@@ -1,48 +1,120 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
+import re
+import shutil
+import subprocess
 from typing import Any
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject
 
+from .agents.base import (
+    AgentAction,
+    AgentAvailability,
+    AgentCapabilities,
+    AgentConfigOption,
+    AgentDescriptor,
+    AgentDriver,
+    AgentEvent,
+    AgentManifest,
+    AgentProfile,
+    AgentPrompt,
+    AgentState,
+    AuthMethod,
+    ConfigOptionValue,
+    FeatureId,
+    FeatureState,
+    FeatureSupport,
+    SessionSnapshot,
+    SessionSummary,
+)
+from .agents.codex_mapping import (
+    normalize_codex_approval,
+    normalize_codex_item,
+    normalize_codex_thread,
+)
 from .models import PLAN_MODE_VALUE, AccessMode, Attachment, ModelInfo, ThreadSummary
-from .rpc import JsonRpcClient
+from .rpc import JsonLineProcess, JsonRpcClient
+
+MIN_CODEX_VERSION = (0, 146, 0)
+CODEX_DESCRIPTOR = AgentDescriptor(
+    "codex",
+    "Codex",
+    "codex",
+    "OpenAI Codex через локальный app-server",
+)
+CODEX_CAPABILITIES = AgentCapabilities(
+    models=True,
+    reasoning_effort=True,
+    access_modes=True,
+    plan_mode=True,
+    authentication=True,
+    rate_limits=True,
+    context_usage=True,
+    session_history=True,
+    attachments=True,
+    image_attachments=True,
+    approvals=True,
+    user_input=True,
+    compact=True,
+    review=True,
+    fork=True,
+)
+CODEX_MANIFEST = AgentManifest(
+    features={
+        feature.value: FeatureSupport(True)
+        for feature in (
+            FeatureId.CONFIG_MODEL,
+            FeatureId.CONFIG_THOUGHT_LEVEL,
+            FeatureId.ACCESS_MODES,
+            FeatureId.RUN_PLAN,
+            FeatureId.AUTHENTICATION,
+            FeatureId.USAGE_QUOTA,
+            FeatureId.USAGE_CONTEXT,
+            FeatureId.SESSION_HISTORY,
+            FeatureId.INPUT_FILES,
+            FeatureId.INPUT_IMAGES,
+            FeatureId.PERMISSIONS,
+            FeatureId.USER_INPUT,
+            FeatureId.SESSION_COMPACT,
+            FeatureId.SESSION_REVIEW,
+            FeatureId.SESSION_FORK,
+            FeatureId.RUN_CANCEL,
+        )
+    },
+    actions=(
+        AgentAction("compact", "Сжать контекст", requires_session=True),
+        AgentAction("review", "Проверить изменения", requires_session=True, argument_hint="Инструкции"),
+        AgentAction("fork", "Создать копию чата", requires_session=True),
+    ),
+    auth_methods=(
+        AuthMethod("chatgpt", "Войти через ChatGPT", "browser"),
+        AuthMethod("api-key", "Войти с API-ключом", "secret"),
+    ),
+    implementation_name="codex",
+)
 
 
-class CodexService(QObject):
-    ready = Signal()
-    accountUpdated = Signal(object)
-    rateLimitsUpdated = Signal(object)
-    modelsUpdated = Signal(object)
-    threadsUpdated = Signal(object)
-    threadLoaded = Signal(dict)
-    currentThreadChanged = Signal(str)
-    itemUpdated = Signal(dict, bool)
-    agentDelta = Signal(str, str)
-    reasoningDelta = Signal(str, str)
-    commandDelta = Signal(str, str)
-    planDelta = Signal(str, str)
-    turnPlanUpdated = Signal(dict)
-    tokenUsageUpdated = Signal(dict)
-    turnStateChanged = Signal(str)
-    approvalRequested = Signal(object, str, dict)
-    userInputRequested = Signal(object, dict)
-    serverRequestResolved = Signal(object)
-    errorOccurred = Signal(str)
-    loginStarted = Signal(dict)
+class CodexDriver(AgentDriver):
+    """Native driver for the Codex app-server protocol."""
 
-    def __init__(self, rpc: JsonRpcClient, parent: QObject | None = None) -> None:
-        super().__init__(parent)
+    def __init__(
+        self,
+        rpc: JsonRpcClient,
+        parent: QObject | None = None,
+        process: JsonLineProcess | None = None,
+    ) -> None:
+        super().__init__(CODEX_DESCRIPTOR, CODEX_MANIFEST, parent)
         self.rpc = rpc
-        self.current_project = ""
-        self.current_thread_id = ""
-        self.current_turn_id = ""
+        self.process = process
         self.current_thread_ready = False
         self._turn_start_pending = False
         self._resuming: set[str] = set()
         self._after_resume: dict[str, list[Callable[[], None]]] = {}
         self._thread_list_generation = 0
+        self._permission_context: dict[object, tuple[str, dict[str, Any]]] = {}
         self.models: list[ModelInfo] = []
         self.account: dict[str, Any] | None = None
         self.connected = False
@@ -55,11 +127,84 @@ class CodexService(QObject):
         if disconnected is not None:
             disconnected.connect(self._disconnected)
 
+    @classmethod
+    def create(cls, executable: str | AgentProfile = "codex") -> "CodexDriver":
+        profile = executable if isinstance(executable, AgentProfile) else None
+        program = profile.executable if profile is not None else executable
+        arguments = list(profile.arguments) if profile and profile.arguments else ["app-server", "--stdio"]
+        process = JsonLineProcess(program, arguments)
+        rpc = JsonRpcClient(process)
+        driver = cls(rpc, process=process)
+        if profile is not None:
+            driver.profile = profile
+            driver.descriptor = AgentDescriptor(
+                profile.id,
+                profile.display_name,
+                profile.executable,
+                profile.description,
+            )
+        process.started.connect(rpc.initialize)
+        process.stopped.connect(driver.processStopped)
+        return driver
+
+    @staticmethod
+    def check_availability(executable: str | AgentProfile | None = None) -> AgentAvailability:
+        if isinstance(executable, AgentProfile):
+            executable = executable.executable
+        path = str(Path(executable).expanduser()) if executable else shutil.which("codex")
+        if not path:
+            return AgentAvailability(
+                False,
+                error=(
+                    "Codex CLI не найден. Установите Codex или укажите путь "
+                    "к исполняемому файлу в меню агента."
+                ),
+            )
+        resolved = shutil.which(path) or path
+        try:
+            completed = subprocess.run(
+                [resolved, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=True,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return AgentAvailability(False, executable=resolved, error=f"Не удалось проверить Codex CLI: {exc}")
+        output = completed.stdout.strip() or completed.stderr.strip()
+        match = re.search(r"(\d+)\.(\d+)\.(\d+)", output)
+        if not match:
+            return AgentAvailability(
+                False,
+                executable=resolved,
+                error=f"Не удалось определить версию Codex: {output}",
+            )
+        version = tuple(map(int, match.groups()))
+        version_text = ".".join(map(str, version))
+        if version < MIN_CODEX_VERSION:
+            required = ".".join(map(str, MIN_CODEX_VERSION))
+            return AgentAvailability(
+                False,
+                executable=resolved,
+                version=version_text,
+                error=f"Нужен Codex CLI {required} или новее; установлен {version_text}.",
+            )
+        return AgentAvailability(True, executable=resolved, version=version_text)
+
+    def start(self) -> None:
+        if self.process is not None:
+            self.process.start()
+
+    def stop(self) -> None:
+        if self.process is not None:
+            self.process.stop()
+
     def _bootstrap(self, _result: dict[str, Any]) -> None:
         self.connected = True
         self.current_turn_id = ""
         self._turn_start_pending = False
         self.turnStateChanged.emit("idle")
+        self._emit_generic_state("idle")
         self.refresh_account()
         self.refresh_models()
         if self.current_thread_id:
@@ -67,6 +212,28 @@ class CodexService(QObject):
         else:
             self.list_threads()
         self.ready.emit()
+
+    def feature_override(self, feature: str) -> FeatureState | None:
+        if feature == FeatureId.USAGE_QUOTA.value:
+            if not self.connected:
+                return FeatureState(True, False, "Codex не подключён")
+            if not isinstance(self.account, dict) or self.account.get("type") != "chatgpt":
+                return FeatureState(
+                    True,
+                    False,
+                    "Недельный лимит доступен только для аккаунта ChatGPT",
+                )
+        return None
+
+    def _emit_generic_state(self, status: str) -> None:
+        self.stateUpdated.emit(
+            AgentState(
+                connection_status="connected" if self.connected else "disconnected",
+                active_profile_id=self.profile.id,
+                active_session_id=self.current_session_id,
+                active_run_id=self.current_run_id,
+            )
+        )
 
     def refresh_account(self) -> None:
         self.rpc.request("account/read", {"refreshToken": False}, self._account_response)
@@ -136,6 +303,37 @@ class CodexService(QObject):
             for row in rows
             if isinstance(row, dict) and not row.get("hidden", False)
         ]
+        model_values = tuple(
+            ConfigOptionValue(model.id, model.display_name)
+            for model in self.models
+            if model.id
+        )
+        config_options: list[AgentConfigOption] = []
+        if model_values:
+            default_model = next((model.id for model in self.models if model.is_default), model_values[0].value)
+            config_options.append(
+                AgentConfigOption(
+                    "model",
+                    "Модель",
+                    category="model",
+                    current_value=default_model,
+                    values=model_values,
+                )
+            )
+        efforts = sorted({effort for model in self.models for effort in model.efforts})
+        if efforts:
+            config_options.append(
+                AgentConfigOption(
+                    "thought_level",
+                    "Уровень рассуждений",
+                    category="thought_level",
+                    current_value=efforts[0],
+                    values=tuple(ConfigOptionValue(value, value) for value in efforts),
+                )
+            )
+        self.manifest = replace(self.manifest, config_options=tuple(config_options))
+        self.manifestUpdated.emit(self.manifest)
+        self.configOptionsUpdated.emit(self.manifest.config_options)
         self.modelsUpdated.emit(self.models)
 
     def set_project(self, path: str) -> None:
@@ -194,6 +392,18 @@ class CodexService(QObject):
                     seen_cursors,
                 )
             else:
+                self.sessionsUpdated.emit(
+                    [
+                        SessionSummary(
+                            item.id,
+                            item.title,
+                            item.cwd,
+                            item.updated_at,
+                            item.status,
+                        )
+                        for item in collected
+                    ]
+                )
                 self.threadsUpdated.emit(collected)
 
         self.rpc.request(
@@ -265,7 +475,9 @@ class CodexService(QObject):
         if result_thread_id and result_thread_id != thread_id:
             self.errorOccurred.emit("Codex вернул данные другого чата")
             return
-        self.threadLoaded.emit(thread)
+        normalized = normalize_codex_thread(thread)
+        self.sessionLoaded.emit(SessionSnapshot(thread_id, raw=normalized))
+        self.threadLoaded.emit(normalized)
 
     def new_thread(
         self,
@@ -317,7 +529,9 @@ class CodexService(QObject):
             self.current_thread_id = thread_id
             self.current_thread_ready = True
             self.currentThreadChanged.emit(self.current_thread_id)
-            self.threadLoaded.emit(thread)
+            normalized = normalize_codex_thread(thread)
+            self.sessionLoaded.emit(SessionSnapshot(thread_id, raw=normalized))
+            self.threadLoaded.emit(normalized)
             self.list_threads()
             if after_created:
                 after_created()
@@ -420,6 +634,60 @@ class CodexService(QObject):
 
         self.rpc.request("turn/start", params, started)
 
+    # Generic driver contract -------------------------------------------------
+    def list_sessions(self) -> None:
+        self.list_threads()
+
+    def load_session(self, session_id: str) -> None:
+        self.open_thread(session_id)
+
+    def prepare_new_session(self) -> None:
+        self.prepare_new_thread()
+
+    def submit_prompt(self, prompt: AgentPrompt) -> None:
+        access_mode = prompt.access_mode
+        if not isinstance(access_mode, AccessMode):
+            access_mode = AccessMode.WORKSPACE_WRITE
+        self.send_message(
+            prompt.text,
+            list(prompt.attachments),
+            str(prompt.config.get("model", "")),
+            str(prompt.config.get("thought_level") or "") or None,
+            access_mode,
+            prompt.mode or None,
+        )
+
+    def cancel_run(self) -> None:
+        self.interrupt()
+
+    def invoke_action(
+        self,
+        action_id: str,
+        arguments: str = "",
+        callback: Any | None = None,
+    ) -> None:
+        if action_id == "compact":
+            self.compact_thread()
+        elif action_id == "review":
+            self.start_review(arguments)
+        elif action_id == "fork":
+            self.fork_thread(callback)
+        else:
+            self.errorOccurred.emit(f"Неизвестное действие Codex: {action_id}")
+            if callback:
+                callback(False)
+
+    def respond_to_request(self, request_id: object, decision: str) -> None:
+        self.resolve_permission(request_id, decision)
+
+    def authenticate(self, method_id: str, secret: str = "") -> None:
+        if method_id == "chatgpt":
+            self.login_chatgpt()
+        elif method_id == "api-key":
+            self.login_api_key(secret)
+        else:
+            self.errorOccurred.emit(f"Неизвестный способ входа Codex: {method_id}")
+
     def compact_thread(self) -> None:
         """Compact the current thread and wait for its turn notifications."""
         if not self.current_thread_id:
@@ -505,7 +773,11 @@ class CodexService(QObject):
                     if isinstance(read_result, dict)
                     else {}
                 )
-                self.threadLoaded.emit(loaded_thread)
+                normalized = normalize_codex_thread(loaded_thread)
+                self.sessionLoaded.emit(
+                    SessionSnapshot(self.current_session_id, raw=normalized)
+                )
+                self.threadLoaded.emit(normalized)
                 self.list_threads()
                 if after_switched:
                     after_switched(True)
@@ -561,6 +833,10 @@ class CodexService(QObject):
             return
         self.rpc.respond(request_id, {"decision": decision})
 
+    def resolve_permission(self, request_id: object, decision: str) -> None:
+        method, params = self._permission_context.pop(request_id, ("", {}))
+        self.answer_approval(request_id, decision, method, params)
+
     def answer_user_input(self, request_id: object, answers: dict[str, list[str]]) -> None:
         payload = {key: {"answers": values} for key, values in answers.items()}
         self.rpc.respond(request_id, {"answers": payload})
@@ -589,6 +865,14 @@ class CodexService(QObject):
             usage = params.get("tokenUsage", {})
             if isinstance(usage, dict):
                 self.tokenUsageUpdated.emit(usage)
+                self.eventReceived.emit(
+                    AgentEvent(
+                        "usage",
+                        self.current_session_id,
+                        self.current_run_id,
+                        payload=usage,
+                    )
+                )
             return
         if method == "turn/plan/updated":
             if self._is_current_turn_event(params):
@@ -603,6 +887,7 @@ class CodexService(QObject):
             self.current_turn_id = str(turn.get("id", ""))
             self._turn_start_pending = False
             self.turnStateChanged.emit("inProgress")
+            self._emit_generic_state("inProgress")
             return
         if method == "turn/completed":
             if not self._is_current_turn_event(params):
@@ -614,6 +899,7 @@ class CodexService(QObject):
             self.current_turn_id = ""
             self._turn_start_pending = False
             self.turnStateChanged.emit(status)
+            self._emit_generic_state(status)
             self.list_threads()
             self.refresh_rate_limits()
             if status == "failed":
@@ -630,30 +916,82 @@ class CodexService(QObject):
                 return
             item = params.get("item", {})
             if isinstance(item, dict):
-                self.itemUpdated.emit(item, method.endswith("completed"))
+                normalized = normalize_codex_item(item)
+                self.itemUpdated.emit(
+                    normalized,
+                    method.endswith("completed"),
+                )
+                self.eventReceived.emit(
+                    AgentEvent(
+                        str(normalized.get("kind", "system_activity")),
+                        self.current_session_id,
+                        self.current_run_id,
+                        str(normalized.get("id", "")),
+                        "completed" if method.endswith("completed") else "started",
+                        normalized,
+                    )
+                )
             return
         if method == "item/agentMessage/delta":
             if not self._is_current_turn_event(params):
                 return
             self.agentDelta.emit(str(params.get("itemId", "")), str(params.get("delta", "")))
+            self.eventReceived.emit(
+                AgentEvent(
+                    "assistant_message",
+                    self.current_session_id,
+                    self.current_run_id,
+                    str(params.get("itemId", "")),
+                    payload={"delta": str(params.get("delta", ""))},
+                )
+            )
             return
         if method in {"item/reasoning/summaryTextDelta", "item/reasoning/textDelta"}:
             if not self._is_current_turn_event(params):
                 return
             self.reasoningDelta.emit(str(params.get("itemId", "")), str(params.get("delta", "")))
+            self.eventReceived.emit(
+                AgentEvent(
+                    "reasoning",
+                    self.current_session_id,
+                    self.current_run_id,
+                    str(params.get("itemId", "")),
+                    payload={"delta": str(params.get("delta", ""))},
+                )
+            )
             return
         if method == "item/commandExecution/outputDelta":
             if not self._is_current_turn_event(params):
                 return
             self.commandDelta.emit(str(params.get("itemId", "")), str(params.get("delta", "")))
+            self.eventReceived.emit(
+                AgentEvent(
+                    "command",
+                    self.current_session_id,
+                    self.current_run_id,
+                    str(params.get("itemId", "")),
+                    payload={"delta": str(params.get("delta", ""))},
+                )
+            )
             return
         if method == "item/plan/delta":
             if not self._is_current_turn_event(params):
                 return
             self.planDelta.emit(str(params.get("itemId", "")), str(params.get("delta", "")))
+            self.eventReceived.emit(
+                AgentEvent(
+                    "plan",
+                    self.current_session_id,
+                    self.current_run_id,
+                    str(params.get("itemId", "")),
+                    payload={"delta": str(params.get("delta", ""))},
+                )
+            )
             return
         if method == "serverRequest/resolved":
-            self.serverRequestResolved.emit(params.get("requestId"))
+            request_id = params.get("requestId")
+            self._permission_context.pop(request_id, None)
+            self.serverRequestResolved.emit(request_id)
             return
         if method == "error":
             error = params.get("error", params)
@@ -666,6 +1004,15 @@ class CodexService(QObject):
             "item/fileChange/requestApproval",
             "item/permissions/requestApproval",
         }:
+            self._permission_context[request_id] = (method, params)
+            request = normalize_codex_approval(
+                request_id,
+                method,
+                params,
+                self.current_project or "не выбрана",
+            )
+            self.clientRequestReceived.emit(request)
+            self.permissionRequested.emit(request)
             self.approvalRequested.emit(request_id, method, params)
             return
         if method == "item/tool/requestUserInput":
@@ -701,5 +1048,12 @@ class CodexService(QObject):
         self._turn_start_pending = False
         self._resuming.clear()
         self._after_resume.clear()
+        self._permission_context.clear()
         if was_running:
             self.turnStateChanged.emit("failed")
+        self._emit_generic_state("disconnected")
+        self.disconnected.emit()
+
+
+# Backward-compatible import for tests and third-party source-tree users.
+CodexService = CodexDriver
