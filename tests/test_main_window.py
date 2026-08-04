@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QObject, QProcess, Qt, Signal
+from PySide6.QtCore import QByteArray, QEvent, QObject, QProcess, Qt, Signal
 from PySide6.QtGui import QTextCursor
-from PySide6.QtWidgets import QLabel, QMessageBox, QPushButton, QWidget
+from PySide6.QtWidgets import QApplication, QLabel, QMessageBox, QPushButton, QWidget
 
 from codex_gui.agents.base import (
     AgentCapabilities,
@@ -271,6 +271,45 @@ def test_macos_notification_does_not_call_linux_notify_send(qtbot, monkeypatch) 
     window._show_desktop_notification("Title", "Message")
 
     assert detached == []
+
+
+def test_returning_to_window_dismisses_desktop_notification(qtbot) -> None:
+    window, _service = make_window(qtbot)
+    dismissed: list[bool] = []
+    window._dismiss_desktop_notification = lambda: dismissed.append(True)  # type: ignore[method-assign]
+
+    QApplication.sendEvent(window, QEvent(QEvent.Type.WindowActivate))
+
+    assert dismissed == [True]
+
+
+def test_linux_notification_is_closed_by_id(monkeypatch) -> None:
+    detached: list[tuple[str, list[str]]] = []
+    monkeypatch.setattr("codex_gui.main_window.shutil.which", lambda command: f"/usr/bin/{command}")
+    monkeypatch.setattr(
+        QProcess,
+        "startDetached",
+        lambda command, arguments: detached.append((command, arguments)),
+    )
+
+    MainWindow._close_linux_notification(42)
+
+    assert detached == [
+        (
+            "gdbus",
+            [
+                "call",
+                "--session",
+                "--dest",
+                "org.freedesktop.Notifications",
+                "--object-path",
+                "/org/freedesktop/Notifications",
+                "--method",
+                "org.freedesktop.Notifications.CloseNotification",
+                "uint32 42",
+            ],
+        )
+    ]
 
 
 def test_message_is_queued_during_active_turn_and_sent_after_completion(qtbot) -> None:

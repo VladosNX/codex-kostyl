@@ -1101,6 +1101,10 @@ class MainWindow(QMainWindow):
         self._sidebar_user_hidden = False
         self._sidebar_auto_hidden = False
         self._closing = False
+        self._desktop_notification_active = False
+        self._desktop_notification_backend = ""
+        self._desktop_notification_generation = 0
+        self._linux_notification_id: int | None = None
         self._build_ui()
         self._build_notifications()
         self._connect_service()
@@ -1153,12 +1157,21 @@ class MainWindow(QMainWindow):
             self.tray_icon.show()
 
     def _show_from_notification(self) -> None:
+        self._dismiss_desktop_notification()
         self.showNormal()
         self.raise_()
         self.activateWindow()
 
     def _show_desktop_notification(self, title: str, message: str) -> None:
+        if QApplication.applicationState() == Qt.ApplicationState.ApplicationActive:
+            return
+
+        self._dismiss_desktop_notification()
+        self._desktop_notification_generation += 1
+        generation = self._desktop_notification_generation
+        self._desktop_notification_active = True
         if self._tray_available and QSystemTrayIcon.supportsMessages():
+            self._desktop_notification_backend = "tray"
             self.tray_icon.showMessage(
                 title,
                 message,
@@ -1166,11 +1179,83 @@ class MainWindow(QMainWindow):
                 7000,
             )
         elif sys.platform.startswith("linux") and shutil.which("notify-send"):
-            QProcess.startDetached(
-                "notify-send",
-                ["--app-name=Codex Kostyl", title, message],
+            self._desktop_notification_backend = "linux"
+            process = QProcess(self)
+            process.finished.connect(
+                lambda exit_code, _exit_status, p=process, g=generation: (
+                    self._linux_notification_started(p, g, exit_code)
+                )
             )
+            process.start(
+                "notify-send",
+                ["--print-id", "--app-name=Codex Kostyl", title, message],
+            )
+        else:
+            self._desktop_notification_active = False
+            self._desktop_notification_backend = ""
         QApplication.alert(self, 4000)
+
+    def _linux_notification_started(
+        self,
+        process: QProcess,
+        generation: int,
+        exit_code: int,
+    ) -> None:
+        output = bytes(process.readAllStandardOutput()).decode(errors="replace").strip()
+        process.deleteLater()
+        try:
+            notification_id = int(output)
+        except ValueError:
+            notification_id = 0
+
+        if exit_code != 0 or notification_id <= 0:
+            if generation == self._desktop_notification_generation:
+                self._desktop_notification_active = False
+                self._desktop_notification_backend = ""
+            return
+        if (
+            generation == self._desktop_notification_generation
+            and self._desktop_notification_active
+        ):
+            self._linux_notification_id = notification_id
+            return
+        self._close_linux_notification(notification_id)
+
+    @staticmethod
+    def _close_linux_notification(notification_id: int) -> None:
+        if notification_id <= 0 or not shutil.which("gdbus"):
+            return
+        QProcess.startDetached(
+            "gdbus",
+            [
+                "call",
+                "--session",
+                "--dest",
+                "org.freedesktop.Notifications",
+                "--object-path",
+                "/org/freedesktop/Notifications",
+                "--method",
+                "org.freedesktop.Notifications.CloseNotification",
+                f"uint32 {notification_id}",
+            ],
+        )
+
+    def _dismiss_desktop_notification(self) -> None:
+        if not self._desktop_notification_active and self._linux_notification_id is None:
+            return
+
+        backend = self._desktop_notification_backend
+        self._desktop_notification_active = False
+        self._desktop_notification_backend = ""
+        if backend == "tray" and self._tray_available:
+            # Qt has no closeMessage(). Removing and immediately restoring the
+            # tray icon dismisses a balloon/toast associated with that icon.
+            self.tray_icon.hide()
+            self.tray_icon.show()
+        if self._linux_notification_id is not None:
+            notification_id = self._linux_notification_id
+            self._linux_notification_id = None
+            self._close_linux_notification(notification_id)
 
     def _toggle_sidebar(self) -> None:
         visible = not self.sidebar_panel.isHidden()
@@ -3985,6 +4070,11 @@ class MainWindow(QMainWindow):
         ):
             self._sidebar_auto_hidden = False
             self._set_sidebar_visible(True)
+
+    def event(self, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.WindowActivate:
+            self._dismiss_desktop_notification()
+        return super().event(event)
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if (
